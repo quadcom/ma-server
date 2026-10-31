@@ -6,7 +6,7 @@ import asyncio
 import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from aiosendspin.models.types import PairMethod
@@ -61,15 +61,18 @@ def _make_pairer(
     )
     provider, refreshed = _make_provider(api, monkeypatch)
     cast("Any", provider.mass).get_provider = lambda _domain: hass
+    provider._hass_sendspin_devices = {}
     pairer = HassAutoPairer(provider)
     if announced:
         pairer._announced = {CLIENT_ID}
     return pairer, api, refreshed
 
 
-def _announce(pairer: HassAutoPairer, client_ids: list[str]) -> None:
+def _announce(
+    pairer: HassAutoPairer, client_ids: list[str], devices: dict[str, str] | None = None
+) -> None:
     """Deliver a snapshot for the live subscription."""
-    pairer._on_clients(pairer._generation, client_ids)
+    pairer._on_clients(pairer._generation, client_ids, devices or {})
 
 
 async def _settle(pairer: HassAutoPairer) -> None:
@@ -228,7 +231,7 @@ async def test_follows_home_assistant_while_it_is_available(
     assert pairer._unsubscribe == unsubscribe
     on_clients = hass.subscribe_sendspin_clients.await_args.args[0]
 
-    on_clients([CLIENT_ID])
+    on_clients([CLIENT_ID], {})
     assert pairer._announced == {CLIENT_ID}
     task = pairer._tasks[CLIENT_ID]
     pairer.unsubscribe()
@@ -240,7 +243,7 @@ async def test_follows_home_assistant_while_it_is_available(
     await _settle(pairer)
 
     # a snapshot of the torn down subscription that was still in flight is ignored
-    on_clients([CLIENT_ID])
+    on_clients([CLIENT_ID], {})
     assert pairer._announced == set()
     assert pairer._tasks == {}
 
@@ -395,3 +398,18 @@ async def test_every_connection_triggers_an_attempt() -> None:
     pairer.on_client_connected.assert_not_called()
     await asyncio.sleep(0)
     pairer.on_client_connected.assert_called_once_with(CLIENT_ID)
+
+
+async def test_device_ids_go_to_the_provider_and_are_cleared_on_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The announced HA device ids reach the provider, which forgets them on unsubscribe."""
+    pairer, _, _ = _make_pairer(monkeypatch, _hass(), announced=False)
+    set_devices = Mock()
+    monkeypatch.setattr(pairer.provider, "set_hass_sendspin_devices", set_devices)
+    _announce(pairer, [CLIENT_ID], {CLIENT_ID: "dev1"})
+    set_devices.assert_called_once_with({CLIENT_ID: "dev1"})
+    await _settle(pairer)
+
+    pairer.unsubscribe()
+    assert set_devices.call_args == call({})

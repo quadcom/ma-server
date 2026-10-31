@@ -191,3 +191,41 @@ async def test_play_announcement_on_entity() -> None:
     # the length is resolved after the announcement was handed to the entity
     provider.mass.streams.get_announcement_duration.assert_awaited_once_with(announcement)
     sleep.assert_awaited_once_with(7)
+
+
+async def test_by_device_id_correlates_name_and_announce_entity() -> None:
+    """A device id resolves to the name and announce-capable entity, keyed by device id."""
+    provider = _provider(
+        [_device(name_by_user="Kitchen")],
+        [_entity("media_player.kitchen")],
+        [_state("media_player.kitchen", MEDIA_ANNOUNCE)],
+    )
+    result = await provider.get_media_player_device_infos_by_device_id(["dev1"], platform="esphome")
+    assert result == {"dev1": {"name": "Kitchen", "announce_entity_id": "media_player.kitchen"}}
+
+
+async def test_by_device_id_applies_the_same_platform_and_announce_rules() -> None:
+    """Foreign platforms and entities without MEDIA_ANNOUNCE are handled as for MACs."""
+    provider = _provider(
+        [_device(), _device("dev2"), _device("dev3")],
+        [
+            _entity("media_player.kitchen"),
+            _entity("media_player.other", "dev2"),
+            _entity("device_tracker.laptop", "dev3", "unifi"),
+        ],
+        [_state("media_player.kitchen", 0), _state("media_player.other", MEDIA_ANNOUNCE)],
+    )
+    result = await provider.get_media_player_device_infos_by_device_id(
+        ["dev1", "dev2", "dev3", "unknown"], platform="esphome"
+    )
+    assert result == {
+        "dev1": {"name": "Kitchen Speaker", "announce_entity_id": None},
+        "dev2": {"name": "Kitchen Speaker", "announce_entity_id": "media_player.other"},
+    }
+
+
+async def test_by_device_id_empty_input_skips_registry_fetch() -> None:
+    """An empty lookup does not hit the Home Assistant registries."""
+    provider = _provider([], [], [])
+    assert await provider.get_media_player_device_infos_by_device_id([], platform="esphome") == {}
+    provider.hass.get_device_registry.assert_not_awaited()
