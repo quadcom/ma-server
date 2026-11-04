@@ -15,6 +15,7 @@ import pytest
 from aiohttp import ClientResponseError
 from hass_client.exceptions import BaseHassClientError, FailedCommand, NotConnected
 from multidict import CIMultiDict
+from music_assistant_models.auth import Scope
 from music_assistant_models.enums import EventType, ProviderFeature
 from music_assistant_models.errors import (
     MusicAssistantError,
@@ -25,11 +26,14 @@ from music_assistant_models.errors import (
 )
 
 from music_assistant.constants import CONF_LOG_LEVEL, CONF_VERIFY_SSL
+from music_assistant.helpers.api import APICommandHandler
 from music_assistant.helpers.tts import TTSLanguageNotSupportedError
 from music_assistant.providers.hass import (
     CONF_AUTH_TOKEN,
     CONF_URL,
+    PLAYER_LOCATIONS_COMMAND,
     STATE_FETCH_BATCH_SIZE,
+    HassPlayerLocations,
     HassRegistryEntity,
     HomeAssistantProvider,
     setup,
@@ -1468,7 +1472,6 @@ async def test_registry_update_of_another_domain_invalidates_the_registry() -> N
     [
         pytest.param({"name": "Old name"}, id="rename"),
         pytest.param({"icon": None}, id="icon"),
-        pytest.param({"labels": []}, id="labels"),
         pytest.param({"hidden_by": None}, id="hidden"),
         # an integration reload re-registers its entities, which touches these
         pytest.param({"capabilities": None, "supported_features": 0}, id="reload"),
@@ -1497,6 +1500,7 @@ async def test_registry_update_of_unmirrored_fields_keeps_the_registry(
         pytest.param({"platform": "old_platform"}, id="platform"),
         pytest.param({"device_id": None}, id="device_id"),
         pytest.param({"area_id": None}, id="area_id"),
+        pytest.param({"labels": []}, id="labels"),
         # the listing omits disabled entities, so this one enters or leaves it
         pytest.param({"disabled_by": None}, id="disabled_by"),
         # a device rename reports no changed fields at all
@@ -1651,15 +1655,18 @@ async def test_registry_leaves_out_the_device_and_area_it_is_not_told_about() ->
     """Report no device or area for the entities whose listing entry omits them."""
     async with _start_provider([_state("tts.only", "Only")]) as (provider, _):
         entities = [
-            {"ei": "light.full", "pl": "esphome", "di": "device", "ai": "area"},
+            {"ei": "light.full", "pl": "esphome", "di": "device", "ai": "area", "lb": ["party"]},
             {"ei": "light.bare", "pl": "esphome"},
-            {"ei": "light.device_only", "pl": "esphome", "di": "other_device"},
+            {"ei": "light.device_only", "pl": "esphome", "di": "other_device", "lb": []},
         ]
         with patch.object(
             provider.hass, "send_command", AsyncMock(return_value={"entities": entities})
         ):
             registry = await provider._fetch_entity_registry()
 
+        assert registry["light.full"] == HassRegistryEntity(
+            platform="esphome", device_id="device", area_id="area", labels=("party",)
+        )
         assert registry["light.bare"] == HassRegistryEntity(
             platform="esphome", device_id=None, area_id=None
         )
@@ -2114,12 +2121,13 @@ async def test_other_config_change_reloads_provider(changed_keys: set[str]) -> N
 
 
 async def test_init_cancelled_during_connect_unregisters_search_command() -> None:
-    """Test a setup timeout while connecting releases the search command for the next init."""
+    """Test a setup timeout while connecting releases the API commands for the next init."""
     hass = _HomeAssistantClient([])
     hass.connect = AsyncMock(side_effect=asyncio.Event().wait)  # type: ignore[method-assign]
     mass = _mass()
-    unregister = MagicMock()
-    mass.register_api_command = MagicMock(return_value=unregister)
+    unregister_search = MagicMock()
+    unregister_locations = MagicMock()
+    mass.register_api_command = MagicMock(side_effect=[unregister_search, unregister_locations])
     manifest = MagicMock()
     manifest.domain = "hass"
     manifest.name = "Home Assistant"
@@ -2129,4 +2137,38 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
             async with asyncio.timeout(0.1):
                 await provider.handle_async_init()
 
-    unregister.assert_called_once()
+    unregister_search.assert_called_once()
+    unregister_locations.assert_called_once()
+
+
+async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> None:
+    """Expose the player locations to any user who may read players, while loaded."""
+    mass = _mass()
+    unregister_search = MagicMock()
+    unregister_locations = MagicMock()
+    mass.register_api_command = MagicMock(side_effect=[unregister_search, unregister_locations])
+    manifest = MagicMock()
+    manifest.domain = "hass"
+    manifest.name = "Home Assistant"
+    with patch(
+        "music_assistant.providers.hass.HomeAssistantClient",
+        return_value=_HomeAssistantClient([]),
+    ):
+        provider = await setup(mass, manifest, _config())
+        assert isinstance(provider, HomeAssistantProvider)
+        async with asyncio.timeout(5):
+            await provider.handle_async_init()
+
+    mass.register_api_command.assert_any_call(
+        PLAYER_LOCATIONS_COMMAND,
+        provider.get_player_locations,
+        required_scope=Scope.PLAYERS_READ,
+    )
+    # the API layer must be able to resolve the command's signature and result type
+    handler = APICommandHandler.parse(PLAYER_LOCATIONS_COMMAND, provider.get_player_locations)
+    assert handler.type_hints["return"] is HassPlayerLocations
+    unregister_locations.assert_not_called()
+
+    await provider.unload()
+
+    unregister_locations.assert_called_once_with()
