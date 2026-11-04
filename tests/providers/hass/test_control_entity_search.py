@@ -259,7 +259,7 @@ async def test_search_command_is_exposed_on_the_api() -> None:
     async with _start_provider() as (provider, _):
         mass = cast("MagicMock", provider.mass)
         unregister = mass.register_api_command.return_value
-        mass.register_api_command.assert_called_once_with(
+        mass.register_api_command.assert_any_call(
             SEARCH_CONTROL_ENTITIES_COMMAND,
             provider.search_control_entities,
             required_scope=Scope.CONFIG_PROVIDERS_READ,
@@ -271,7 +271,8 @@ async def test_search_command_is_exposed_on_the_api() -> None:
         assert handler.type_hints["return"] is HassControlEntitySearchResult
         unregister.assert_not_called()
 
-    unregister.assert_called_once_with()
+    # the same mock stands in for the unregister callable of every command the provider exposes
+    assert unregister.call_count == mass.register_api_command.call_count
 
 
 @pytest.mark.parametrize(
