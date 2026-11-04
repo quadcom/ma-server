@@ -26,6 +26,16 @@
     "verify_ssl": {
       "label": "[%key:common::config_entries::verify_ssl::label%]",
       "description": "[%key:common::config_entries::verify_ssl::description%]"
+    },
+    "player_grouping": {
+      "label": "Speaker grouping",
+      "description": "How speaker lists group your players, using where they are placed in Home Assistant. This one choice applies to everyone in the household.",
+      "options": {
+        "floor": "By floor",
+        "area": "By area",
+        "label": "By label",
+        "none": "No grouping"
+      }
     }
   },
   "setup_flow": {

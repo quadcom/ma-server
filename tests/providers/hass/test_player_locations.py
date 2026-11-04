@@ -12,6 +12,7 @@ import pytest
 from music_assistant_models.errors import ProviderUnavailableError
 
 from music_assistant.providers.hass import HomeAssistantProvider
+from music_assistant.providers.hass.constants import CONF_PLAYER_GROUPING
 
 AREAS = [
     {"area_id": "kitchen", "name": "Kitchen", "floor_id": "ground"},
@@ -64,6 +65,7 @@ def _provider(
     entities: list[dict[str, Any]],
     *,
     connected: bool = True,
+    config_values: dict[str, Any] | None = None,
 ) -> HomeAssistantProvider:
     async def _send_command(command: str, **_kwargs: Any) -> Any:
         if command == "config/entity_registry/list_for_display":
@@ -84,7 +86,11 @@ def _provider(
     provider._entity_registry = None
     provider._entity_registry_lock = asyncio.Lock()
     # the registry lookups run through @use_cache, which needs a cache to talk to
-    provider.config = SimpleNamespace(instance_id="hass--test")  # type: ignore[assignment]
+    values = config_values or {}
+    provider.config = SimpleNamespace(  # type: ignore[assignment]
+        instance_id="hass--test",
+        get_value=lambda key, default=None: values.get(key, default),
+    )
     provider.manifest = SimpleNamespace(domain="hass")  # type: ignore[assignment]
     players = MagicMock()
     players.all_players = MagicMock(
@@ -110,6 +116,7 @@ async def test_area_and_floor_come_from_the_device() -> None:
     result = await provider.get_player_locations()
 
     assert result == {
+        "grouping": "none",
         "players": {
             "player1": {
                 "area": "Kitchen",
@@ -117,7 +124,7 @@ async def test_area_and_floor_come_from_the_device() -> None:
                 "floor_level": 0,
                 "labels": [],
             }
-        }
+        },
     }
 
 
@@ -236,3 +243,25 @@ async def test_disconnected_home_assistant_raises() -> None:
 
     with pytest.raises(ProviderUnavailableError):
         await provider.get_player_locations()
+
+
+async def test_grouping_defaults_to_none() -> None:
+    """Hand out no grouping while the household has not picked one."""
+    provider = _provider(["player1"], [], [])
+
+    assert (await provider.get_player_locations())["grouping"] == "none"
+
+
+@pytest.mark.parametrize("grouping", ["floor", "area", "label", "none"])
+async def test_grouping_is_handed_out_as_configured(grouping: str) -> None:
+    """Hand out the grouping picked in the provider settings."""
+    provider = _provider(["player1"], [], [], config_values={CONF_PLAYER_GROUPING: grouping})
+
+    assert (await provider.get_player_locations())["grouping"] == grouping
+
+
+async def test_unknown_grouping_is_handed_out_as_none() -> None:
+    """Hand out none for a stored grouping that clients would not know."""
+    provider = _provider(["player1"], [], [], config_values={CONF_PLAYER_GROUPING: "room"})
+
+    assert (await provider.get_player_locations())["grouping"] == "none"

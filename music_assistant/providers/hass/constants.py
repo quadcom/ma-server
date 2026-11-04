@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import IntFlag
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from music_assistant_models.enums import PlaybackState
 
@@ -13,6 +13,12 @@ if TYPE_CHECKING:
 CONF_POWER_CONTROLS = "power_controls"
 CONF_MUTE_CONTROLS = "mute_controls"
 CONF_VOLUME_CONTROLS = "volume_controls"
+CONF_PLAYER_GROUPING = "player_grouping"
+
+# How clients group the players in their speaker lists, by where Home Assistant places them.
+# One value per household, picked in the provider settings and handed out with the locations.
+PLAYER_GROUPINGS: Final = ("floor", "area", "label", "none")
+DEFAULT_PLAYER_GROUPING: Final = "none"
 
 # Home Assistant entity domains Music Assistant can offer as player controls.
 CONTROL_DOMAINS = ("media_player", "switch", "input_boolean", "number", "input_number")

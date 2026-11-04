@@ -40,6 +40,7 @@ from music_assistant.providers.hass import (
 )
 from music_assistant.providers.hass.constants import (
     CONF_MUTE_CONTROLS,
+    CONF_PLAYER_GROUPING,
     CONF_POWER_CONTROLS,
     CONF_VOLUME_CONTROLS,
 )
@@ -2105,10 +2106,12 @@ async def test_control_selection_drops_a_value_that_is_no_entity_id() -> None:
         {f"values/{CONF_URL}"},
         # a control list changing alongside another value still needs the reload
         {f"values/{CONF_POWER_CONTROLS}", f"values/{CONF_URL}"},
+        # and so does the player grouping
+        {f"values/{CONF_PLAYER_GROUPING}", f"values/{CONF_URL}"},
     ],
 )
 async def test_other_config_change_reloads_provider(changed_keys: set[str]) -> None:
-    """Any change beyond the control lists reloads the provider."""
+    """Any change beyond the control lists and the player grouping reloads the provider."""
     async with _start_provider([]) as (provider, _hass):
         mass = cast("MagicMock", provider.mass)
         await provider.loaded_in_mass()
@@ -2118,6 +2121,63 @@ async def test_other_config_change_reloads_provider(changed_keys: set[str]) -> N
 
         mass.call_later.assert_called_once()
         assert mass.call_later.call_args[0][1] is mass.load_provider_config
+
+
+@pytest.mark.parametrize("running_as_hass_addon", [True, False])
+async def test_config_entries_offer_the_player_grouping(running_as_hass_addon: bool) -> None:
+    """Offer the four player groupings, defaulting to none, with or without the add-on."""
+    async with _start_provider([]) as (provider, _):
+        cast("MagicMock", provider.mass).running_as_hass_addon = running_as_hass_addon
+        entries = await provider.get_config_entries()
+
+    entry = next(entry for entry in entries if entry.key == CONF_PLAYER_GROUPING)
+    assert [option.value for option in entry.options] == ["floor", "area", "label", "none"]
+    assert entry.default_value == "none"
+    assert entry.required is False
+
+
+async def test_player_grouping_change_applies_without_reload() -> None:
+    """Pick another grouping without reconnecting or touching the player controls."""
+    states = [_state("media_player.kitchen", "Kitchen")]
+    async with _start_provider(states, **{CONF_POWER_CONTROLS: ["media_player.kitchen"]}) as (
+        provider,
+        hass,
+    ):
+        mass = cast("MagicMock", provider.mass)
+        await provider.loaded_in_mass()
+        mass.call_later.reset_mock()
+        subscriptions = len(hass.subscriptions)
+        new_config = _config(
+            **{CONF_POWER_CONTROLS: ["media_player.kitchen"], CONF_PLAYER_GROUPING: "floor"}
+        )
+
+        await provider.update_config(new_config, {f"values/{CONF_PLAYER_GROUPING}"})
+
+        mass.call_later.assert_not_called()
+        assert provider.config is new_config
+        assert len(hass.subscriptions) == subscriptions
+        assert provider._player_grouping() == "floor"
+
+
+async def test_player_grouping_and_control_change_reconciles_without_reload() -> None:
+    """Apply a grouping change together with a control change, still without a reload."""
+    states = [_state("media_player.kitchen", "Kitchen"), _state("switch.amp", "Amp")]
+    async with _start_provider(states, **{CONF_POWER_CONTROLS: ["media_player.kitchen"]}) as (
+        provider,
+        _hass,
+    ):
+        mass = cast("MagicMock", provider.mass)
+        await provider.loaded_in_mass()
+        mass.call_later.reset_mock()
+
+        await provider.update_config(
+            _config(**{CONF_POWER_CONTROLS: ["switch.amp"], CONF_PLAYER_GROUPING: "label"}),
+            {f"values/{CONF_POWER_CONTROLS}", f"values/{CONF_PLAYER_GROUPING}"},
+        )
+
+        mass.call_later.assert_not_called()
+        assert set(provider._player_controls or {}) == {"switch.amp"}
+        assert provider._player_grouping() == "label"
 
 
 async def test_init_cancelled_during_connect_unregisters_search_command() -> None:
