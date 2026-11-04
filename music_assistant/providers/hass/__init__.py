@@ -17,7 +17,7 @@ from functools import partial
 from itertools import batched
 from sys import intern
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, TypedDict, cast
 from urllib.parse import unquote, urlsplit
 
 from aiohttp import ClientResponseError
@@ -32,7 +32,7 @@ from hass_client.exceptions import (
 )
 from hass_client.utils import get_websocket_url
 from music_assistant_models.auth import Scope
-from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
@@ -62,9 +62,12 @@ from music_assistant.models.plugin import AIEngine, ImageEngine, PluginProvider,
 
 from .constants import (
     CONF_MUTE_CONTROLS,
+    CONF_PLAYER_GROUPING,
     CONF_POWER_CONTROLS,
     CONF_VOLUME_CONTROLS,
+    DEFAULT_PLAYER_GROUPING,
     OFF_STATES,
+    PLAYER_GROUPINGS,
     AITaskEntityFeature,
     MediaPlayerEntityFeature,
     parse_supported_features,
@@ -184,6 +187,8 @@ class HassPlayerLocation(TypedDict):
 class HassPlayerLocations(TypedDict):
     """Result of the player locations command, keyed by player ID."""
 
+    # how the household wants speaker lists grouped, as set in the provider settings
+    grouping: Literal["floor", "area", "label", "none"]
     players: dict[str, HassPlayerLocation]
 
 
@@ -206,6 +211,20 @@ def _control_config_entries() -> tuple[ConfigEntry, ...]:
             category="player_controls",
         )
         for conf_key in (CONF_POWER_CONTROLS, CONF_VOLUME_CONTROLS, CONF_MUTE_CONTROLS)
+    )
+
+
+def _grouping_config_entry() -> ConfigEntry:
+    """Return the config entry holding how speaker lists group the players."""
+    return ConfigEntry(
+        key=CONF_PLAYER_GROUPING,
+        type=ConfigEntryType.STRING,
+        label=CONF_PLAYER_GROUPING,
+        options=[ConfigValueOption(grouping) for grouping in PLAYER_GROUPINGS],
+        default_value=DEFAULT_PLAYER_GROUPING,
+        required=False,
+        # applied in place by update_config, without reconnecting to Home Assistant
+        requires_reload=False,
     )
 
 
@@ -291,7 +310,7 @@ class HomeAssistantProvider(PluginProvider):
             # url/token/verify_ssl are collected by the setup flow instead (see setup_flow.py)
             base_entries = ()
 
-        return (*base_entries, *_control_config_entries())
+        return (*base_entries, *_control_config_entries(), _grouping_config_entry())
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the plugin."""
@@ -376,9 +395,10 @@ class HomeAssistantProvider(PluginProvider):
         """
         Handle logic when the config is updated.
 
-        A change limited to the player control selection is applied in place, so adding or
-        removing a control does not drop and re-establish the Home Assistant connection.
-        Any other change reloads the provider as usual.
+        A change limited to the player control selection and the player grouping is applied
+        in place, so adding or removing a control, or picking another grouping, does not drop
+        and re-establish the Home Assistant connection. Any other change reloads the provider
+        as usual.
 
         Raises when the in place update fails (because Home Assistant is unreachable, for
         example); the controls are then left as they were and a later update retries.
@@ -390,12 +410,15 @@ class HomeAssistantProvider(PluginProvider):
             f"values/{conf_key}"
             for conf_key in (CONF_POWER_CONTROLS, CONF_VOLUME_CONTROLS, CONF_MUTE_CONTROLS)
         }
-        if not changed_keys or not changed_keys <= control_keys:
+        in_place_keys = {*control_keys, f"values/{CONF_PLAYER_GROUPING}"}
+        if not changed_keys or not changed_keys <= in_place_keys:
             await super().update_config(config, changed_keys)
             return
-        # store the new config before reconciling: the control lists are read back from it
+        # store the new config before reconciling: the control lists are read back from it,
+        # and the grouping is read from it whenever the locations are asked for
         self.config = config
-        await self._register_player_controls()
+        if changed_keys & control_keys:
+            await self._register_player_controls()
 
     async def get_diagnostics(self) -> dict[str, SerializableType]:
         """Return diagnostics info for this provider to include in diagnostics reports."""
@@ -743,7 +766,7 @@ class HomeAssistantProvider(PluginProvider):
             locations[player.player_id] = _player_location(
                 device, entity, cast("Mapping[str, Mapping[str, Any]]", areas), floors, labels
             )
-        return {"players": locations}
+        return {"grouping": self._player_grouping(), "players": locations}
 
     async def get_states(
         self,
@@ -1513,6 +1536,15 @@ class HomeAssistantProvider(PluginProvider):
             "list[dict[str, Any]]", await self.hass.send_command("config/label_registry/list")
         )
         return {label["label_id"]: label for label in labels}
+
+    def _player_grouping(self) -> Literal["floor", "area", "label", "none"]:
+        """Return the configured player grouping, falling back to none for an unknown value."""
+        grouping = self.config.get_value(CONF_PLAYER_GROUPING, DEFAULT_PLAYER_GROUPING)
+        if grouping not in PLAYER_GROUPINGS:
+            # a hand-edited setting, or one a later version added, is not passed on as is:
+            # clients only know these four
+            grouping = DEFAULT_PLAYER_GROUPING
+        return cast("Literal['floor', 'area', 'label', 'none']", grouping)
 
 
 def _supports_image_generation(state: State) -> bool:
