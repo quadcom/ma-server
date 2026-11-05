@@ -55,6 +55,7 @@ class HassAutoPairer:
         self._generation += 1
         self._announced.clear()
         self._pending.clear()
+        self.provider.set_hass_sendspin_devices({})
         if (unsubscribe := self._unsubscribe) is not None:
             self._unsubscribe = None
             unsubscribe()
@@ -88,11 +89,12 @@ class HassAutoPairer:
             return
         self._unsubscribe = unsubscribe
 
-    def _on_clients(self, generation: int, client_ids: list[str]) -> None:
+    def _on_clients(self, generation: int, client_ids: list[str], devices: dict[str, str]) -> None:
         """Handle the client ids Home Assistant can fetch a pairing token for."""
         if generation != self._generation:
             # a snapshot of a subscription that was torn down meanwhile
             return
+        self.provider.set_hass_sendspin_devices(devices)
         announced = set(client_ids)
         new_client_ids = announced - self._announced
         self._announced = announced

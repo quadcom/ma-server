@@ -51,15 +51,35 @@ async def test_returns_none_without_a_token(error: Exception) -> None:
 async def test_subscribes_to_the_client_ids() -> None:
     """Each snapshot Home Assistant sends is passed on as a plain list of client ids."""
     provider = _provider()
-    snapshots: list[list[str]] = []
-    unsubscribe = await provider.subscribe_sendspin_clients(snapshots.append)
+    snapshots: list[tuple[list[str], dict[str, str]]] = []
+    unsubscribe = await provider.subscribe_sendspin_clients(
+        lambda client_ids, devices: snapshots.append((client_ids, devices))
+    )
     assert unsubscribe is provider.hass.subscribe.return_value
     on_message, command = provider.hass.subscribe.await_args.args
     assert command == "sendspin/subscribe_clients"
 
     on_message({"id": 1, "type": "event", "event": {"client_ids": [CLIENT_ID, "other"]}})
     on_message({"id": 1, "type": "event", "event": {"client_ids": []}})
-    assert snapshots == [[CLIENT_ID, "other"], []]
+    assert snapshots == [([CLIENT_ID, "other"], {}), ([], {})]
+
+
+async def test_subscription_passes_on_the_device_ids() -> None:
+    """The HA device ids announced with the client ids are passed on as a plain dict."""
+    provider = _provider()
+    snapshots: list[tuple[list[str], dict[str, str]]] = []
+    await provider.subscribe_sendspin_clients(
+        lambda client_ids, devices: snapshots.append((client_ids, devices))
+    )
+    on_message = provider.hass.subscribe.await_args.args[0]
+    on_message(
+        {
+            "id": 1,
+            "type": "event",
+            "event": {"client_ids": [CLIENT_ID], "devices": {CLIENT_ID: "dev1"}},
+        }
+    )
+    assert snapshots == [([CLIENT_ID], {CLIENT_ID: "dev1"})]
 
 
 @pytest.mark.parametrize(

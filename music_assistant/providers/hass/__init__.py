@@ -494,70 +494,52 @@ class HomeAssistantProvider(PluginProvider):
         ]
         if not mac_devices:
             return {}
-        platform_device_ids: set[str] = set()
-        media_players_by_device: dict[str, list[str]] = {}
-        for entity_id, entry in (await self.get_entity_registry()).items():
-            if entry.platform != platform or not (device_id := entry.device_id):
-                continue
-            platform_device_ids.add(device_id)
-            if entity_id.startswith("media_player."):
-                media_players_by_device.setdefault(device_id, []).append(entity_id)
-        # other integrations (e.g. network trackers) register their own devices for the same MAC
-        device_by_mac: dict[str, Device] = {
-            mac: device for mac, device in mac_devices if device["id"] in platform_device_ids
-        }
-        candidates_by_mac = {
-            mac: media_players_by_device.get(device["id"], [])
-            for mac, device in device_by_mac.items()
-        }
-        states = {
-            state["entity_id"]: state
-            for state in await self.get_states(
-                entity_ids=[
-                    entity_id
-                    for entity_ids in candidates_by_mac.values()
-                    for entity_id in entity_ids
-                ]
-            )
-        }
+        return await self._media_player_device_infos(mac_devices, platform)
 
-        def _supports_announce(entity_id: str) -> bool:
-            if (state := states.get(entity_id)) is None:
-                return False
-            supported_features = parse_supported_features(
-                state["attributes"].get("supported_features"), entity_id, self.logger
-            )
-            return MediaPlayerEntityFeature.MEDIA_ANNOUNCE in supported_features
+    async def get_media_player_device_infos_by_device_id(
+        self,
+        device_ids: Collection[str],
+        platform: str,
+    ) -> dict[str, DeviceMediaPlayerInfo]:
+        """
+        Correlate devices (by HA device id) to their HA name and media_player entity.
 
-        return {
-            mac: DeviceMediaPlayerInfo(
-                name=device["name_by_user"] or device["name"],
-                announce_entity_id=next(
-                    (
-                        entity_id
-                        for entity_id in candidates_by_mac[mac]
-                        if _supports_announce(entity_id)
-                    ),
-                    None,
-                ),
-            )
-            for mac, device in device_by_mac.items()
-        }
+        Like get_media_player_device_infos, for devices whose HA device id is already known
+        (e.g. announced by the Home Assistant Sendspin integration), which also works when the
+        MAC address the device reports is not the one Home Assistant stores.
+
+        :param device_ids: HA device ids to look up.
+        :param platform: The HA integration domain the devices and their media_player entities
+            must belong to.
+        :return: Correlation info keyed by HA device id; devices unknown to Home Assistant or to
+            that integration are absent from the result.
+        """
+        wanted_ids = set(device_ids)
+        if not wanted_ids:
+            return {}
+        devices = [
+            (device["id"], device)
+            for device in (await self.get_device_registry()).values()
+            if device["id"] in wanted_ids
+        ]
+        return await self._media_player_device_infos(devices, platform)
 
     async def subscribe_sendspin_clients(
-        self, callback: Callable[[list[str]], None]
+        self, callback: Callable[[list[str], dict[str, str]], None]
     ) -> Callable[[], None] | None:
         """
         Follow the Sendspin client ids Home Assistant can fetch a pairing token for.
 
-        :param callback: Called with the full list of client ids right away and again
-            whenever it changes.
+        :param callback: Called with the full list of client ids and the HA device id of
+            each client that has one (empty when this Home Assistant does not send them) right
+            away and again whenever either changes.
         :return: A function that ends the subscription, or None when this Home Assistant
             hands out no Sendspin pairing tokens or could not be asked.
         """
 
         def _on_message(message: Message) -> None:
-            callback(list(message["event"]["client_ids"]))
+            event = message["event"]
+            callback(list(event["client_ids"]), dict(event.get("devices", {})))
 
         try:
             unsubscribe = await self.hass.subscribe(_on_message, "sendspin/subscribe_clients")
@@ -852,6 +834,68 @@ class HomeAssistantProvider(PluginProvider):
             verify_ssl=not self.mass.running_as_hass_addon
             and bool(self.get_setup_value(CONF_VERIFY_SSL, True)),
         )
+
+    async def _media_player_device_infos(
+        self, devices: list[tuple[str, Device]], platform: str
+    ) -> dict[str, DeviceMediaPlayerInfo]:
+        """
+        Resolve name and announce-capable media_player of devices belonging to a platform.
+
+        Takes (key, device) pairs rather than a mapping, as several devices can share a key
+        (a MAC); the one belonging to the platform is the one that counts.
+        """
+        if not devices:
+            return {}
+        platform_device_ids: set[str] = set()
+        media_players_by_device: dict[str, list[str]] = {}
+        for entity_id, entry in (await self.get_entity_registry()).items():
+            if entry.platform != platform or not (device_id := entry.device_id):
+                continue
+            platform_device_ids.add(device_id)
+            if entity_id.startswith("media_player."):
+                media_players_by_device.setdefault(device_id, []).append(entity_id)
+        # other integrations (e.g. network trackers) register their own devices for the same MAC,
+        # so the device must belong to the platform
+        device_by_key: dict[str, Device] = {
+            key: device for key, device in devices if device["id"] in platform_device_ids
+        }
+        candidates_by_key = {
+            key: media_players_by_device.get(device["id"], [])
+            for key, device in device_by_key.items()
+        }
+        states = {
+            state["entity_id"]: state
+            for state in await self.get_states(
+                entity_ids=[
+                    entity_id
+                    for entity_ids in candidates_by_key.values()
+                    for entity_id in entity_ids
+                ]
+            )
+        }
+
+        def _supports_announce(entity_id: str) -> bool:
+            if (state := states.get(entity_id)) is None:
+                return False
+            supported_features = parse_supported_features(
+                state["attributes"].get("supported_features"), entity_id, self.logger
+            )
+            return MediaPlayerEntityFeature.MEDIA_ANNOUNCE in supported_features
+
+        return {
+            key: DeviceMediaPlayerInfo(
+                name=device["name_by_user"] or device["name"],
+                announce_entity_id=next(
+                    (
+                        entity_id
+                        for entity_id in candidates_by_key[key]
+                        if _supports_announce(entity_id)
+                    ),
+                    None,
+                ),
+            )
+            for key, device in device_by_key.items()
+        }
 
     async def _hass_listener(self) -> None:
         """Start listening on the HA websockets."""

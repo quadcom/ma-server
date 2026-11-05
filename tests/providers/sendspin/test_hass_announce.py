@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
 import pytest
 from music_assistant_models.enums import PlayerFeature
@@ -45,16 +46,25 @@ def _player(*, player_id: str = MAC, hello_mac: str | None = None) -> SendspinPl
 def _provider(hass_provider: object | None) -> SendspinProvider:
     provider = SendspinProvider.__new__(SendspinProvider)
     provider.mass = cast(
-        "MusicAssistant", SimpleNamespace(get_provider=lambda _domain: hass_provider)
+        "MusicAssistant",
+        SimpleNamespace(
+            get_provider=lambda _domain: hass_provider,
+            create_task=lambda coro, **_kwargs: asyncio.ensure_future(coro),
+        ),
     )
     provider.logger = Mock()
+    provider._hass_sendspin_devices = {}
     return provider
 
 
-def _hass_provider(device_infos: dict[str, dict[str, str | None]]) -> SimpleNamespace:
+def _hass_provider(
+    device_infos: dict[str, dict[str, str | None]],
+    infos_by_device_id: dict[str, dict[str, str | None]] | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         available=True,
         get_media_player_device_infos=AsyncMock(return_value=device_infos),
+        get_media_player_device_infos_by_device_id=AsyncMock(return_value=infos_by_device_id or {}),
         play_announcement_on_entity=AsyncMock(),
     )
 
@@ -170,3 +180,84 @@ async def test_play_announcement_requires_resolved_entity() -> None:
     )
     with pytest.raises(PlayerCommandFailed):
         await player.play_announcement(PlayerMedia(uri="http://mass.local/announcement.mp3"))
+
+
+async def test_enrichment_uses_the_announced_device_id_when_the_mac_does_not_match() -> None:
+    """A player HA announced a device id for is resolved by it, not by its (Ethernet) MAC."""
+    hass = _hass_provider(
+        {}, {"dev1": {"name": "Kitchen Speaker", "announce_entity_id": ENTITY_ID}}
+    )
+    player = _player()
+    provider = _provider(hass)
+    provider._hass_sendspin_devices = {MAC: "dev1"}
+    await provider._apply_hass_esphome_enrichment([player])
+    assert player._attr_name == "Kitchen Speaker"
+    assert player._hass_announce_entity_id == ENTITY_ID
+    hass.get_media_player_device_infos_by_device_id.assert_awaited_once_with(
+        ["dev1"], platform="esphome"
+    )
+    hass.get_media_player_device_infos.assert_not_awaited()
+
+
+async def test_enrichment_resolves_players_outside_the_map_by_mac_alongside() -> None:
+    """Players in the map and players outside it each use their own lookup, once per kind."""
+    other_mac = "11:22:33:44:55:66"
+    hass = _hass_provider(
+        {other_mac: {"name": "Porch", "announce_entity_id": None}},
+        {"dev1": {"name": "Kitchen Speaker", "announce_entity_id": ENTITY_ID}},
+    )
+    by_id, by_mac = _player(), _player(player_id=other_mac)
+    provider = _provider(hass)
+    provider._hass_sendspin_devices = {MAC: "dev1"}
+    await provider._apply_hass_esphome_enrichment([by_id, by_mac])
+    assert by_id._attr_name == "Kitchen Speaker"
+    assert by_mac._attr_name == "Porch"
+    hass.get_media_player_device_infos.assert_awaited_once_with([other_mac], platform="esphome")
+    hass.get_media_player_device_infos_by_device_id.assert_awaited_once()
+
+
+async def test_enrichment_without_announced_devices_is_by_mac_only() -> None:
+    """With no device ids announced (older HA) the by-device-id lookup is never made."""
+    hass = _hass_provider({MAC: {"name": "Kitchen Speaker", "announce_entity_id": ENTITY_ID}})
+    await _provider(hass)._apply_hass_esphome_enrichment([_player()])
+    hass.get_media_player_device_infos_by_device_id.assert_not_awaited()
+
+
+async def test_enrichment_clears_announce_entity_for_an_unknown_device_id() -> None:
+    """A device id HA no longer resolves drops the announce relay."""
+    player = _player()
+    player.set_hass_announce_entity(ENTITY_ID)
+    provider = _provider(_hass_provider({}))
+    provider._hass_sendspin_devices = {MAC: "gone"}
+    await provider._apply_hass_esphome_enrichment([player])
+    assert player._hass_announce_entity_id is None
+
+
+async def test_a_changed_device_map_triggers_re_enrichment() -> None:
+    """Storing a different map refreshes the enrichment; the same map does nothing."""
+    provider = _provider(_hass_provider({}))
+    refresh = AsyncMock()
+    provider._refresh_hass_esphome_enrichment = refresh  # type: ignore[method-assign]
+    provider.set_hass_sendspin_devices({MAC: "dev1"})
+    await asyncio.sleep(0)
+    refresh.assert_awaited_once()
+    provider.set_hass_sendspin_devices({MAC: "dev1"})
+    await asyncio.sleep(0)
+    refresh.assert_awaited_once()
+    assert provider._hass_sendspin_devices == {MAC: "dev1"}
+
+
+async def test_refresh_includes_players_with_an_announced_device_id() -> None:
+    """A player with no reported MAC is still refreshed when HA announced its device id."""
+    player = _player(player_id="jyu3dS9mC2xHq0yGm7Hn3oUuZz8kPq1wLr5tXv0aB4c")
+    player.update_state = Mock()  # type: ignore[method-assign,misc]
+    provider = _provider(_hass_provider({}))
+    provider._hass_sendspin_devices = {player.player_id: "dev1"}
+    apply = AsyncMock()
+    provider._apply_hass_esphome_enrichment = apply  # type: ignore[method-assign]
+    with (
+        patch.object(SendspinProvider, "players", [player]),
+        patch.object(SendspinPlayer, "initialized", PropertyMock(return_value=Mock())),
+    ):
+        await provider._refresh_hass_esphome_enrichment()
+    apply.assert_awaited_once_with([player])
