@@ -77,6 +77,7 @@ from .control_entities import (
     ControlEntitySearch,
     HassControlEntitySearchResult,
 )
+from .group_colours import GroupColours, groups_from_players
 from .helpers import ControlCapabilities, get_control_name, is_entity_id
 
 if TYPE_CHECKING:
@@ -95,6 +96,7 @@ if TYPE_CHECKING:
         State,
     )
     from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.event import MassEvent
     from music_assistant_models.player import PlayerMedia
     from music_assistant_models.provider import ProviderManifest
 
@@ -190,6 +192,8 @@ class HassPlayerLocations(TypedDict):
     # how the household wants speaker lists grouped, as set in the provider settings
     grouping: Literal["floor", "area", "label", "none"]
     players: dict[str, HassPlayerLocation]
+    # the colour of every sync group the user can see the leader of, keyed by leader ID
+    group_colours: dict[str, str]
 
 
 async def setup(
@@ -252,6 +256,8 @@ class HomeAssistantProvider(PluginProvider):
     _control_entity_search: ControlEntitySearch
     _unregister_search_command: Callable[[], None] | None = None
     _unregister_locations_command: Callable[[], None] | None = None
+    _unsubscribe_player_events: Callable[[], None] | None = None
+    _group_colours: GroupColours | None = None
 
     @property
     def url(self) -> str | None:
@@ -346,6 +352,13 @@ class HomeAssistantProvider(PluginProvider):
             PLAYER_LOCATIONS_COMMAND,
             self.get_player_locations,
             required_scope=Scope.PLAYERS_READ,
+        )
+        # follow the sync groups as they change, so a group that changes leader between
+        # two requests for the locations still keeps its colour
+        self._group_colours = GroupColours()
+        self._unsubscribe_player_events = self.mass.subscribe(
+            self._on_player_event,
+            (EventType.PLAYER_ADDED, EventType.PLAYER_UPDATED, EventType.PLAYER_REMOVED),
         )
         try:
             await self.hass.connect()
@@ -766,7 +779,16 @@ class HomeAssistantProvider(PluginProvider):
             locations[player.player_id] = _player_location(
                 device, entity, cast("Mapping[str, Mapping[str, Any]]", areas), floors, labels
             )
-        return {"grouping": self._player_grouping(), "players": locations}
+        # the colours are worked out over every player, so all users agree on them, but
+        # only the groups whose leader this user can see are handed out
+        colours = self._refresh_group_colours().colours
+        return {
+            "grouping": self._player_grouping(),
+            "players": locations,
+            "group_colours": {
+                leader_id: colour for leader_id, colour in colours.items() if leader_id in locations
+            },
+        }
 
     async def get_states(
         self,
@@ -1302,6 +1324,9 @@ class HomeAssistantProvider(PluginProvider):
         if unregister := self._unregister_locations_command:
             self._unregister_locations_command = None
             unregister()
+        if unsubscribe := self._unsubscribe_player_events:
+            self._unsubscribe_player_events = None
+            unsubscribe()
         self._control_entity_search.close()
         if unsubscribe := self._unsubscribe_controls:
             self._unsubscribe_controls = None
@@ -1536,6 +1561,17 @@ class HomeAssistantProvider(PluginProvider):
             "list[dict[str, Any]]", await self.hass.send_command("config/label_registry/list")
         )
         return {label["label_id"]: label for label in labels}
+
+    def _on_player_event(self, event: MassEvent) -> None:
+        """Follow a change to the players, which may start, change or end a sync group."""
+        self._refresh_group_colours()
+
+    def _refresh_group_colours(self) -> GroupColours:
+        """Bring the group colours in line with the sync groups as they are now."""
+        if self._group_colours is None:
+            self._group_colours = GroupColours()
+        self._group_colours.update(groups_from_players(self.mass.players.iter_players()))
+        return self._group_colours
 
     def _player_grouping(self) -> Literal["floor", "area", "label", "none"]:
         """Return the configured player grouping, falling back to none for an unknown value."""

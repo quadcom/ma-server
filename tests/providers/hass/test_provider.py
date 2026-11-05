@@ -2228,7 +2228,13 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
     handler = APICommandHandler.parse(PLAYER_LOCATIONS_COMMAND, provider.get_player_locations)
     assert handler.type_hints["return"] is HassPlayerLocations
     unregister_locations.assert_not_called()
+    # the group colours follow every change to the players
+    mass.subscribe.assert_any_call(
+        provider._on_player_event,
+        (EventType.PLAYER_ADDED, EventType.PLAYER_UPDATED, EventType.PLAYER_REMOVED),
+    )
 
     await provider.unload()
 
     unregister_locations.assert_called_once_with()
+    assert mass.subscribe.return_value.call_count >= 1

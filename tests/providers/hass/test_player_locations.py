@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from music_assistant_models.enums import PlayerType
 from music_assistant_models.errors import ProviderUnavailableError
 
 from music_assistant.providers.hass import HomeAssistantProvider
@@ -66,6 +67,7 @@ def _provider(
     *,
     connected: bool = True,
     config_values: dict[str, Any] | None = None,
+    all_players: list[Any] | None = None,
 ) -> HomeAssistantProvider:
     async def _send_command(command: str, **_kwargs: Any) -> Any:
         if command == "config/entity_registry/list_for_display":
@@ -96,6 +98,8 @@ def _provider(
     players.all_players = MagicMock(
         return_value=[SimpleNamespace(player_id=player_id) for player_id in player_ids]
     )
+    # every player regardless of the user, from which the group colours are worked out
+    players.iter_players = MagicMock(return_value=all_players or [])
     provider.mass = SimpleNamespace(  # type: ignore[assignment]
         cache=_Cache(),
         players=players,
@@ -125,6 +129,7 @@ async def test_area_and_floor_come_from_the_device() -> None:
                 "labels": [],
             }
         },
+        "group_colours": {},
     }
 
 
@@ -265,3 +270,64 @@ async def test_unknown_grouping_is_handed_out_as_none() -> None:
     provider = _provider(["player1"], [], [], config_values={CONF_PLAYER_GROUPING: "room"})
 
     assert (await provider.get_player_locations())["grouping"] == "none"
+
+
+def _grouped_player(
+    player_id: str, group_members: list[str] | None = None, synced_to: str | None = None
+) -> Any:
+    return SimpleNamespace(
+        player_id=player_id,
+        type=PlayerType.PLAYER,
+        state=SimpleNamespace(
+            group_members=group_members or [], synced_to=synced_to, active_group=None
+        ),
+    )
+
+
+async def test_group_colours_are_handed_out_for_the_visible_leaders() -> None:
+    """Hand out the colour of every group whose leader the user can see."""
+    everyone = [
+        _grouped_player("kitchen", group_members=["kitchen", "dining"]),
+        _grouped_player("dining", synced_to="kitchen"),
+        # a group led by a player this user may not see still takes a colour
+        _grouped_player("garage", group_members=["garage", "shed"]),
+        _grouped_player("shed", synced_to="garage"),
+        _grouped_player("office"),
+    ]
+    provider = _provider(["kitchen", "dining", "office"], [], [], all_players=everyone)
+
+    result = await provider.get_player_locations()
+
+    # the garage group took orange, so all users agree kitchen's group is purple
+    assert result["group_colours"] == {"kitchen": "purple"}
+
+
+async def test_group_colour_survives_a_change_of_leader() -> None:
+    """Keep a group's colour when a member takes over from the leader between requests."""
+    players = [
+        _grouped_player("kitchen", group_members=["kitchen", "dining", "deck"]),
+        _grouped_player("dining", synced_to="kitchen"),
+        _grouped_player("deck", synced_to="kitchen"),
+        _grouped_player("office", group_members=["office", "den"]),
+        _grouped_player("den", synced_to="office"),
+    ]
+    provider = _provider(
+        ["kitchen", "dining", "deck", "office", "den"], [], [], all_players=players
+    )
+    assert (await provider.get_player_locations())["group_colours"] == {
+        "kitchen": "orange",
+        "office": "purple",
+    }
+
+    # the kitchen leaves its group and the dining room takes over
+    players[0:3] = [
+        _grouped_player("kitchen"),
+        _grouped_player("dining", group_members=["dining", "deck"]),
+        _grouped_player("deck", synced_to="dining"),
+    ]
+    provider._on_player_event(MagicMock())
+
+    assert (await provider.get_player_locations())["group_colours"] == {
+        "dining": "orange",
+        "office": "purple",
+    }
