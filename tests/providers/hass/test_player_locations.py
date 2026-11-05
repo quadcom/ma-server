@@ -325,7 +325,7 @@ async def test_group_colour_survives_a_change_of_leader() -> None:
         _grouped_player("dining", group_members=["dining", "deck"]),
         _grouped_player("deck", synced_to="dining"),
     ]
-    provider._on_player_event(MagicMock())
+    provider._refresh_group_colours()
 
     assert (await provider.get_player_locations())["group_colours"] == {
         "dining": "orange",

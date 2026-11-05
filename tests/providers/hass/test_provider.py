@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from math import ceil
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -32,6 +33,7 @@ from music_assistant.providers.hass import (
     CONF_AUTH_TOKEN,
     CONF_URL,
     PLAYER_LOCATIONS_COMMAND,
+    SPEAKER_LIST_COMMAND,
     STATE_FETCH_BATCH_SIZE,
     HassPlayerLocations,
     HassRegistryEntity,
@@ -44,6 +46,7 @@ from music_assistant.providers.hass.constants import (
     CONF_POWER_CONTROLS,
     CONF_VOLUME_CONTROLS,
 )
+from music_assistant.providers.hass.speaker_list import SpeakerList
 from tests.common import use_real_create_task
 
 LAST_CHANGED = 1683832716.072648
@@ -433,10 +436,11 @@ async def test_feature_resolution_starts_listener_first() -> None:
     ]
 
     async with _start_provider(states) as (provider, hass):
-        assert hass.calls[:4] == [
+        # the entity registry subscription, then the four that place players
+        assert hass.calls[:8] == [
             "connect",
             "start_listening",
-            "subscribe_events",
+            *["subscribe_events"] * 5,
             REGISTRY_LIST_COMMAND,
         ]
         assert ProviderFeature.AI_QUERY in provider.supported_features
@@ -463,9 +467,9 @@ async def test_feature_resolution_failure_cleans_up_connection() -> None:
     assert hass.calls == [
         "connect",
         "start_listening",
-        "subscribe_events",
+        *["subscribe_events"] * 5,
         REGISTRY_LIST_COMMAND,
-        "unsubscribe_events",
+        *["unsubscribe_events"] * 5,
         "disconnect",
     ]
     assert provider._listen_task is None
@@ -1785,17 +1789,37 @@ async def test_registry_entries_of_nothing_skips_the_round_trip() -> None:
 async def test_entity_registry_subscription_is_replaced() -> None:
     """Replace the entity registry subscription instead of stacking a second one."""
     async with _start_provider([_state("tts.only", "Only")]) as (provider, hass):
-        assert hass.active_event_subscriptions == 1
+        # the entity registry, plus the four registries that place players
+        assert hass.active_event_subscriptions == 5
         assert hass.event_subscriptions[0][0] == "entity_registry_updated"
 
         await provider._subscribe_entity_registry()
 
-        assert hass.active_event_subscriptions == 1
+        assert hass.active_event_subscriptions == 5
         assert hass.calls[-2:] == ["unsubscribe_events", "subscribe_events"]
 
         await provider.unload()
 
         assert hass.active_event_subscriptions == 0
+
+
+async def test_location_registries_are_watched_for_the_speaker_list() -> None:
+    """Watch the device, area, floor and label registries, and drop each stale listing."""
+    async with _start_provider([_state("tts.only", "Only")]) as (provider, hass):
+        mass = cast("MagicMock", provider.mass)
+        assert {event_type for event_type, _ in hass.event_subscriptions} >= {
+            "device_registry_updated",
+            "area_registry_updated",
+            "floor_registry_updated",
+            "label_registry_updated",
+        }
+        mass.call_later.reset_mock()
+        with patch.object(provider.mass.cache, "delete", AsyncMock(), create=True) as delete:
+            hass.fire_event("area_registry_updated", {"action": "update", "area_id": "den"})
+            await asyncio.sleep(0)
+
+        delete.assert_awaited_once_with("_fetch_area_registry", provider=provider.instance_id)
+        assert mass.call_later.call_args[0][1] == provider._signal_speaker_list
 
 
 async def test_config_entries_do_not_read_home_assistant() -> None:
@@ -2153,7 +2177,9 @@ async def test_player_grouping_change_applies_without_reload() -> None:
 
         await provider.update_config(new_config, {f"values/{CONF_PLAYER_GROUPING}"})
 
-        mass.call_later.assert_not_called()
+        assert all(
+            call.args[1] is not mass.load_provider_config for call in mass.call_later.call_args_list
+        )
         assert provider.config is new_config
         assert len(hass.subscriptions) == subscriptions
         assert provider._player_grouping() == "floor"
@@ -2175,7 +2201,9 @@ async def test_player_grouping_and_control_change_reconciles_without_reload() ->
             {f"values/{CONF_POWER_CONTROLS}", f"values/{CONF_PLAYER_GROUPING}"},
         )
 
-        mass.call_later.assert_not_called()
+        assert all(
+            call.args[1] is not mass.load_provider_config for call in mass.call_later.call_args_list
+        )
         assert set(provider._player_controls or {}) == {"switch.amp"}
         assert provider._player_grouping() == "label"
 
@@ -2187,7 +2215,10 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
     mass = _mass()
     unregister_search = MagicMock()
     unregister_locations = MagicMock()
-    mass.register_api_command = MagicMock(side_effect=[unregister_search, unregister_locations])
+    unregister_speaker_list = MagicMock()
+    mass.register_api_command = MagicMock(
+        side_effect=[unregister_search, unregister_locations, unregister_speaker_list]
+    )
     manifest = MagicMock()
     manifest.domain = "hass"
     manifest.name = "Home Assistant"
@@ -2199,6 +2230,7 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
 
     unregister_search.assert_called_once()
     unregister_locations.assert_called_once()
+    unregister_speaker_list.assert_called_once()
 
 
 async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> None:
@@ -2206,7 +2238,10 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
     mass = _mass()
     unregister_search = MagicMock()
     unregister_locations = MagicMock()
-    mass.register_api_command = MagicMock(side_effect=[unregister_search, unregister_locations])
+    unregister_speaker_list = MagicMock()
+    mass.register_api_command = MagicMock(
+        side_effect=[unregister_search, unregister_locations, unregister_speaker_list]
+    )
     manifest = MagicMock()
     manifest.domain = "hass"
     manifest.name = "Home Assistant"
@@ -2234,7 +2269,86 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
         (EventType.PLAYER_ADDED, EventType.PLAYER_UPDATED, EventType.PLAYER_REMOVED),
     )
 
+    mass.register_api_command.assert_any_call(
+        SPEAKER_LIST_COMMAND,
+        provider.get_speaker_list,
+        required_scope=Scope.PLAYERS_READ,
+    )
+    handler = APICommandHandler.parse(SPEAKER_LIST_COMMAND, provider.get_speaker_list)
+    assert handler.type_hints["return"] is SpeakerList
+
     await provider.unload()
 
     unregister_locations.assert_called_once_with()
+    unregister_speaker_list.assert_called_once_with()
     assert mass.subscribe.return_value.call_count >= 1
+
+
+async def test_speaker_list_is_announced_once_after_a_burst_of_changes() -> None:
+    """Debounce changes into one provider event that carries the new revision."""
+    async with _start_provider([]) as (provider, _):
+        mass = cast("MagicMock", provider.mass)
+        mass.call_later.reset_mock()
+
+        provider._speaker_list_changed()
+        provider._speaker_list_changed()
+
+        # every call re-arms the same task, so only the last one runs
+        task_ids = {call.kwargs["task_id"] for call in mass.call_later.call_args_list}
+        assert task_ids == {f"{provider.instance_id}.speaker_list"}
+        mass.signal_event.reset_mock()
+        provider._signal_speaker_list()
+
+        mass.signal_event.assert_called_once_with(
+            EventType.PROVIDER_EVENT,
+            object_id=f"{provider.instance_id}/speaker_list",
+            data={"revision": 1},
+        )
+
+
+async def test_player_change_announces_the_speaker_list_only_when_it_matters() -> None:
+    """Announce a player change the list uses, and stay quiet for one it does not."""
+    async with _start_provider([]) as (provider, _):
+        mass = cast("MagicMock", provider.mass)
+        state = SimpleNamespace(
+            player_id="kitchen",
+            name="Kitchen",
+            type="player",
+            enabled=True,
+            available=True,
+            hide_in_ui=False,
+            private=False,
+            group_members=[],
+            static_group_members=[],
+            synced_to=None,
+            active_group=None,
+            can_group_with=[],
+            volume_level=10,
+        )
+        mass.players.iter_players = MagicMock(
+            return_value=[SimpleNamespace(player_id="kitchen", type="player", state=state)]
+        )
+        provider._on_player_event(MagicMock())
+        mass.call_later.reset_mock()
+
+        state.volume_level = 30
+        provider._on_player_event(MagicMock())
+        mass.call_later.assert_not_called()
+
+        state.hide_in_ui = True
+        provider._on_player_event(MagicMock())
+        mass.call_later.assert_called_once()
+
+
+async def test_grouping_change_announces_the_speaker_list() -> None:
+    """Announce a changed speaker list when the household picks another grouping."""
+    async with _start_provider([]) as (provider, _):
+        mass = cast("MagicMock", provider.mass)
+        await provider.loaded_in_mass()
+        mass.call_later.reset_mock()
+
+        await provider.update_config(
+            _config(**{CONF_PLAYER_GROUPING: "area"}), {f"values/{CONF_PLAYER_GROUPING}"}
+        )
+
+        assert mass.call_later.call_args[0][1] == provider._signal_speaker_list

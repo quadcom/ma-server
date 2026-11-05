@@ -79,6 +79,7 @@ from .control_entities import (
 )
 from .group_colours import GroupColours, groups_from_players
 from .helpers import ControlCapabilities, get_control_name, is_entity_id
+from .speaker_list import SpeakerList, build_speaker_list
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping
@@ -123,6 +124,19 @@ LABEL_REGISTRY_CACHE_TTL = 60
 
 SEARCH_CONTROL_ENTITIES_COMMAND = f"{DOMAIN}/search_control_entities"
 PLAYER_LOCATIONS_COMMAND = f"{DOMAIN}/player_locations"
+SPEAKER_LIST_COMMAND = f"{DOMAIN}/speaker_list"
+# clients hear of a changed speaker list through a provider event under this sub scope
+SPEAKER_LIST_EVENT_SCOPE = "speaker_list"
+# window to collect changes in, so a burst of player or registry updates sends one event
+SPEAKER_LIST_DEBOUNCE = 1.0
+# Home Assistant registry events that can move a player to another area, floor or label,
+# with the cached listing each one makes stale
+LOCATION_REGISTRY_EVENTS: Final = {
+    "device_registry_updated": "_fetch_device_registry",
+    "area_registry_updated": "_fetch_area_registry",
+    "floor_registry_updated": "_fetch_floor_registry",
+    "label_registry_updated": "_fetch_label_registry",
+}
 # the integration domain under which Home Assistant's Music Assistant integration
 # registers a device (and its media_player entity) for every Music Assistant player
 HASS_MUSIC_ASSISTANT_DOMAIN = "music_assistant"
@@ -258,6 +272,12 @@ class HomeAssistantProvider(PluginProvider):
     _unregister_locations_command: Callable[[], None] | None = None
     _unsubscribe_player_events: Callable[[], None] | None = None
     _group_colours: GroupColours | None = None
+    _unregister_speaker_list_command: Callable[[], None] | None = None
+    _unsubscribe_location_registries: list[Callable[[], None]] | None = None
+    # bumped (and announced) whenever the speaker list may look different
+    _speaker_list_revision: int = 0
+    # what the speaker list was last built from, to tell a relevant player change apart
+    _speaker_list_players: frozenset[tuple[Any, ...]] | None = None
 
     @property
     def url(self) -> str | None:
@@ -340,26 +360,9 @@ class HomeAssistantProvider(PluginProvider):
         self._entity_registry = None
         self._entity_registry_lock = asyncio.Lock()
         self._control_entity_search = ControlEntitySearch(self)
-        # registering here rather than in loaded_in_mass pairs the command with the teardown
-        # in _disconnect_hass, so a reload can never leave it registered twice
-        self._unregister_search_command = self.mass.register_api_command(
-            SEARCH_CONTROL_ENTITIES_COMMAND,
-            self.search_control_entities,
-            required_scope=Scope.CONFIG_PROVIDERS_READ,
-        )
-        # any signed-in user may see where the players they can see are placed
-        self._unregister_locations_command = self.mass.register_api_command(
-            PLAYER_LOCATIONS_COMMAND,
-            self.get_player_locations,
-            required_scope=Scope.PLAYERS_READ,
-        )
-        # follow the sync groups as they change, so a group that changes leader between
-        # two requests for the locations still keeps its colour
-        self._group_colours = GroupColours()
-        self._unsubscribe_player_events = self.mass.subscribe(
-            self._on_player_event,
-            (EventType.PLAYER_ADDED, EventType.PLAYER_UPDATED, EventType.PLAYER_REMOVED),
-        )
+        # registering here rather than in loaded_in_mass pairs the commands with the teardown
+        # in _disconnect_hass, so a reload can never leave them registered twice
+        self._register_api_commands()
         try:
             await self.hass.connect()
         except asyncio.CancelledError:
@@ -375,6 +378,7 @@ class HomeAssistantProvider(PluginProvider):
             # registry change can slip through unnoticed; _disconnect_hass tears the
             # subscription down again on the failure paths below
             await self._subscribe_entity_registry()
+            await self._subscribe_location_registries()
             await self._resolve_startup_features()
         except asyncio.CancelledError:
             await self._cleanup_failed_init()
@@ -430,6 +434,8 @@ class HomeAssistantProvider(PluginProvider):
         # store the new config before reconciling: the control lists are read back from it,
         # and the grouping is read from it whenever the locations are asked for
         self.config = config
+        if f"values/{CONF_PLAYER_GROUPING}" in changed_keys:
+            self._speaker_list_changed()
         if changed_keys & control_keys:
             await self._register_player_controls()
 
@@ -789,6 +795,32 @@ class HomeAssistantProvider(PluginProvider):
                 leader_id: colour for leader_id, colour in colours.items() if leader_id in locations
             },
         }
+
+    async def get_speaker_list(self) -> SpeakerList:
+        """
+        Return the finished speaker list for the current user, for clients to draw as is.
+
+        The players are sorted into sections by the household's grouping (floor, area,
+        label or none), with "Other" last. Hidden, disabled, protocol and source players
+        are left out, and so are the rooms a permanent group player stands in for; the
+        group player itself is listed as a room. Groups made on the fly carry their
+        colour, and their members name their leader.
+
+        Clients are told of a change by a provider event under the sub scope
+        "speaker_list", carrying the new revision, and then ask again.
+        """
+        locations = await self.get_player_locations()
+        everyone = list(self.mass.players.iter_players())
+        group_colours = self._refresh_group_colours()
+        return build_speaker_list(
+            visible=self.mass.players.all_players(),
+            everyone=everyone,
+            locations=locations["players"],
+            grouping=locations["grouping"],
+            groups=groups_from_players(everyone),
+            colours=group_colours.colours,
+            revision=self._speaker_list_revision,
+        )
 
     async def get_states(
         self,
@@ -1324,6 +1356,12 @@ class HomeAssistantProvider(PluginProvider):
         if unregister := self._unregister_locations_command:
             self._unregister_locations_command = None
             unregister()
+        if unregister := self._unregister_speaker_list_command:
+            self._unregister_speaker_list_command = None
+            unregister()
+        for unsubscribe_registry in self._unsubscribe_location_registries or ():
+            unsubscribe_registry()
+        self._unsubscribe_location_registries = None
         if unsubscribe := self._unsubscribe_player_events:
             self._unsubscribe_player_events = None
             unsubscribe()
@@ -1464,6 +1502,8 @@ class HomeAssistantProvider(PluginProvider):
         if _affects_mirrored_registry(data):
             self._entity_registry = None
             self._entity_registry_generation += 1
+            # an entity's area or labels may have changed
+            self._speaker_list_changed()
         elif self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
             # the kept mirror rests on which fields Home Assistant reports, so leave a
             # trail that tells a stale entity listing apart from a lookup that never ran
@@ -1562,9 +1602,86 @@ class HomeAssistantProvider(PluginProvider):
         )
         return {label["label_id"]: label for label in labels}
 
+    def _register_api_commands(self) -> None:
+        """Expose the provider's API commands and follow the players for them."""
+        self._unregister_search_command = self.mass.register_api_command(
+            SEARCH_CONTROL_ENTITIES_COMMAND,
+            self.search_control_entities,
+            required_scope=Scope.CONFIG_PROVIDERS_READ,
+        )
+        # any signed-in user may see where the players they can see are placed
+        self._unregister_locations_command = self.mass.register_api_command(
+            PLAYER_LOCATIONS_COMMAND,
+            self.get_player_locations,
+            required_scope=Scope.PLAYERS_READ,
+        )
+        self._unregister_speaker_list_command = self.mass.register_api_command(
+            SPEAKER_LIST_COMMAND,
+            self.get_speaker_list,
+            required_scope=Scope.PLAYERS_READ,
+        )
+        # follow the sync groups as they change, so a group that changes leader between
+        # two requests for the locations still keeps its colour
+        self._group_colours = GroupColours()
+        self._unsubscribe_player_events = self.mass.subscribe(
+            self._on_player_event,
+            (EventType.PLAYER_ADDED, EventType.PLAYER_UPDATED, EventType.PLAYER_REMOVED),
+        )
+
+    async def _subscribe_location_registries(self) -> None:
+        """Watch the Home Assistant registries that place players, for the speaker list."""
+        for unsubscribe_registry in self._unsubscribe_location_registries or ():
+            unsubscribe_registry()
+        self._unsubscribe_location_registries = [
+            await self.hass.subscribe_events(self._on_location_registry_update, event_type)
+            for event_type in LOCATION_REGISTRY_EVENTS
+        ]
+
+    def _on_location_registry_update(self, event: Event) -> None:
+        """Drop the stale registry listing and announce a changed speaker list."""
+        if cache_key := LOCATION_REGISTRY_EVENTS.get(event["event_type"]):
+            self.mass.create_task(self.mass.cache.delete(cache_key, provider=self.instance_id))
+        self._speaker_list_changed()
+
     def _on_player_event(self, event: MassEvent) -> None:
         """Follow a change to the players, which may start, change or end a sync group."""
         self._refresh_group_colours()
+        # most player updates (volume, position) leave the speaker list as it is
+        players = frozenset(
+            (
+                state.player_id,
+                state.name,
+                state.type,
+                state.enabled,
+                state.available,
+                state.hide_in_ui,
+                state.private,
+                tuple(state.group_members),
+                tuple(state.static_group_members),
+                state.synced_to,
+                state.active_group,
+                tuple(sorted(state.can_group_with)),
+            )
+            for state in (player.state for player in self.mass.players.iter_players())
+        )
+        if players != self._speaker_list_players:
+            self._speaker_list_players = players
+            self._speaker_list_changed()
+
+    def _speaker_list_changed(self) -> None:
+        """Announce a changed speaker list once the current burst of changes is over."""
+        self.mass.call_later(
+            SPEAKER_LIST_DEBOUNCE,
+            self._signal_speaker_list,
+            task_id=f"{self.instance_id}.{SPEAKER_LIST_EVENT_SCOPE}",
+        )
+
+    def _signal_speaker_list(self) -> None:
+        """Bump the speaker list revision and tell the clients to ask again."""
+        self._speaker_list_revision += 1
+        self.signal_provider_event(
+            {"revision": self._speaker_list_revision}, sub_scope=SPEAKER_LIST_EVENT_SCOPE
+        )
 
     def _refresh_group_colours(self) -> GroupColours:
         """Bring the group colours in line with the sync groups as they are now."""
