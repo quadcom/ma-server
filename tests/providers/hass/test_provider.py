@@ -17,7 +17,7 @@ from aiohttp import ClientResponseError
 from hass_client.exceptions import BaseHassClientError, FailedCommand, NotConnected
 from multidict import CIMultiDict
 from music_assistant_models.auth import Scope
-from music_assistant_models.enums import EventType, ProviderFeature
+from music_assistant_models.enums import EventType, PlayerType, ProviderFeature
 from music_assistant_models.errors import (
     MusicAssistantError,
     ProviderUnavailableError,
@@ -2338,6 +2338,43 @@ async def test_player_change_announces_the_speaker_list_only_when_it_matters() -
         state.hide_in_ui = True
         provider._on_player_event(MagicMock())
         mass.call_later.assert_called_once()
+
+
+async def test_speaker_list_keeps_the_callers_own_hidden_player() -> None:
+    """List the hidden client player the caller connected on, but no one else's."""
+    async with _start_provider([]) as (provider, _):
+        mass = cast("MagicMock", provider.mass)
+
+        def _client(player_id: str) -> Any:
+            state = SimpleNamespace(
+                name=player_id,
+                type=PlayerType.PLAYER,
+                enabled=True,
+                available=True,
+                hide_in_ui=True,
+                private=True,
+                group_members=[],
+                static_group_members=[],
+                synced_to=None,
+                active_group=None,
+                can_group_with=[],
+            )
+            return SimpleNamespace(player_id=player_id, type="player", state=state)
+
+        players = [_client("mine"), _client("theirs")]
+        mass.players.all_players = MagicMock(return_value=players)
+        mass.players.iter_players = MagicMock(return_value=players)
+        locations = {"grouping": "none", "players": {}, "group_colours": {}}
+        with (
+            patch.object(provider, "get_player_locations", AsyncMock(return_value=locations)),
+            patch(
+                "music_assistant.providers.hass.is_own_client_player",
+                side_effect=lambda player: player.player_id == "mine",
+            ),
+        ):
+            result = await provider.get_speaker_list()
+
+        assert list(result["rooms"]) == ["mine"]
 
 
 async def test_grouping_change_announces_the_speaker_list() -> None:

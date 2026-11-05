@@ -54,6 +54,7 @@ from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import CONF_VERIFY_SSL, VERBOSE_LOG_LEVEL
 from music_assistant.controllers.cache import use_cache
+from music_assistant.controllers.webserver.helpers.auth_middleware import is_own_client_player
 from music_assistant.helpers.datetime import iso_from_utc_timestamp
 from music_assistant.helpers.json import SerializableType
 from music_assistant.helpers.tts import TTSLanguageNotSupportedError, match_tts_language
@@ -803,7 +804,8 @@ class HomeAssistantProvider(PluginProvider):
         The players are sorted into sections by the household's grouping (floor, area,
         label or none), with "Other" last. Hidden, disabled, protocol and source players
         are left out, and so are the rooms a permanent group player stands in for; the
-        group player itself is listed as a room. Groups made on the fly carry their
+        group player itself is listed as a room. The caller's own client player (such as
+        its web player) is listed even while hidden. Groups made on the fly carry their
         colour, and their members name their leader.
 
         Clients are told of a change by a provider event under the sub scope
@@ -811,15 +813,19 @@ class HomeAssistantProvider(PluginProvider):
         """
         locations = await self.get_player_locations()
         everyone = list(self.mass.players.iter_players())
+        visible = self.mass.players.all_players()
         group_colours = self._refresh_group_colours()
         return build_speaker_list(
-            visible=self.mass.players.all_players(),
+            visible=visible,
             everyone=everyone,
             locations=locations["players"],
             grouping=locations["grouping"],
             groups=groups_from_players(everyone),
             colours=group_colours.colours,
             revision=self._speaker_list_revision,
+            own_player_id=next(
+                (player.player_id for player in visible if is_own_client_player(player)), None
+            ),
         )
 
     async def get_states(

@@ -231,7 +231,7 @@ def test_groups_made_on_the_fly_grey_their_members() -> None:
 
 
 def test_group_with_follows_the_stock_group_editor() -> None:
-    """Offer what the leader can group with, minus what the stock editor would not offer."""
+    """Offer what the leader can group with, leaving out hidden and unavailable players."""
     players = [
         _player(
             "kitchen",
@@ -250,4 +250,40 @@ def test_group_with_follows_the_stock_group_editor() -> None:
     result = _build(players, locations, groups={"kitchen": {"deck"}}, colours={"kitchen": "pink"})
 
     # the current member stays on offer so it can be taken out again
-    assert result["rooms"]["kitchen"]["group_with"] == ["deck", "dining", "hidden"]
+    assert result["rooms"]["kitchen"]["group_with"] == ["deck", "dining"]
+
+
+def test_the_callers_own_hidden_player_is_listed() -> None:
+    """List the caller's own client player while hidden, and no other hidden player."""
+    players = [
+        _player("mine", hide_in_ui=True, private=True),
+        _player("theirs", hide_in_ui=True, private=True),
+        _player("off", hide_in_ui=True, private=True, enabled=False),
+        _player("kitchen", can_group_with=["mine", "theirs"]),
+    ]
+    locations = {p.player_id: _at() for p in players}
+
+    result = build_speaker_list(
+        visible=players,
+        everyone=players,
+        locations=locations,  # type: ignore[arg-type]
+        grouping="floor",
+        groups={},
+        colours={},
+        revision=1,
+        own_player_id="mine",
+    )
+
+    assert list(result["rooms"]) == ["mine", "kitchen"]
+    # a hidden player is never offered to a group, the caller's own one included
+    assert result["rooms"]["kitchen"]["group_with"] == []
+    assert build_speaker_list(
+        visible=players,
+        everyone=players,
+        locations=locations,  # type: ignore[arg-type]
+        grouping="floor",
+        groups={},
+        colours={},
+        revision=1,
+        own_player_id="off",
+    )["rooms"].keys() == {"kitchen"}

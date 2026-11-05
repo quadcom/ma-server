@@ -83,6 +83,7 @@ def build_speaker_list(
     groups: Mapping[str, set[str]],
     colours: Mapping[str, str],
     revision: int,
+    own_player_id: str | None = None,
 ) -> SpeakerList:
     """
     Build the speaker list one user sees.
@@ -94,6 +95,8 @@ def build_speaker_list(
     :param groups: The groups made on the fly, as leader ID to member IDs.
     :param colours: The colour of each group made on the fly, keyed by leader ID.
     :param revision: The revision to report, which changes whenever the list may have.
+    :param own_player_id: The private client player the caller connected on (such as its
+        web player), listed even while hidden, as the client shows it as "this device".
     """
     visible_players = {player.player_id: player for player in visible}
     group_players = [player for player in everyone if player.state.type == PlayerType.GROUP]
@@ -111,7 +114,7 @@ def build_speaker_list(
         player
         for player in visible_players.values()
         if player.state.enabled
-        and not player.state.hide_in_ui
+        and (not player.state.hide_in_ui or player.player_id == own_player_id)
         and player.state.type not in _NEVER_LISTED
         and player.player_id not in swallowed
     ]
@@ -189,10 +192,10 @@ def _group_with(
     """
     Return the rooms a group editor may offer to group with the given room.
 
-    Follows the stock group editor: a player the leader can group with, enabled and
-    available, not private while hidden (hiding only takes a player out of the lists),
-    able to join a group and not part of another group player. The current members of
-    the leader's group are offered too, so they can be taken out again.
+    A player the leader can group with, enabled and available, not hidden (a hidden
+    player stays out of the group editor as it does out of the list), able to join a
+    group and not part of another group player. The current members of the leader's
+    group are offered too, so they can be taken out again.
     """
     can_group_with = set(leader.state.can_group_with)
     offered = set(groups.get(leader.player_id, ())) & set(visible_players)
@@ -204,7 +207,7 @@ def _group_with(
             and player_id not in swallowed
             and state.enabled
             and state.available
-            and not (state.hide_in_ui and state.private)
+            and not state.hide_in_ui
             and state.type not in _NEVER_GROUPED
             and (not state.active_group or state.active_group == leader.player_id)
         ):
