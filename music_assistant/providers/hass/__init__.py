@@ -17,7 +17,7 @@ from functools import partial
 from itertools import batched
 from sys import intern
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, TypedDict, cast
 from urllib.parse import unquote, urlsplit
 
 from aiohttp import ClientResponseError
@@ -32,7 +32,7 @@ from hass_client.exceptions import (
 )
 from hass_client.utils import get_websocket_url
 from music_assistant_models.auth import Scope
-from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
@@ -54,6 +54,7 @@ from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import CONF_VERIFY_SSL, VERBOSE_LOG_LEVEL
 from music_assistant.controllers.cache import use_cache
+from music_assistant.controllers.webserver.helpers.auth_middleware import is_own_client_player
 from music_assistant.helpers.datetime import iso_from_utc_timestamp
 from music_assistant.helpers.json import SerializableType
 from music_assistant.helpers.tts import TTSLanguageNotSupportedError, match_tts_language
@@ -62,9 +63,12 @@ from music_assistant.models.plugin import AIEngine, ImageEngine, PluginProvider,
 
 from .constants import (
     CONF_MUTE_CONTROLS,
+    CONF_PLAYER_GROUPING,
     CONF_POWER_CONTROLS,
     CONF_VOLUME_CONTROLS,
+    DEFAULT_PLAYER_GROUPING,
     OFF_STATES,
+    PLAYER_GROUPINGS,
     AITaskEntityFeature,
     MediaPlayerEntityFeature,
     parse_supported_features,
@@ -74,7 +78,9 @@ from .control_entities import (
     ControlEntitySearch,
     HassControlEntitySearchResult,
 )
+from .group_colours import GroupColours, groups_from_players
 from .helpers import ControlCapabilities, get_control_name, is_entity_id
+from .speaker_list import SpeakerList, build_speaker_list
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping
@@ -92,6 +98,7 @@ if TYPE_CHECKING:
         State,
     )
     from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.event import MassEvent
     from music_assistant_models.player import PlayerMedia
     from music_assistant_models.provider import ProviderManifest
 
@@ -112,8 +119,28 @@ ENGINE_REFRESH_DEBOUNCE = 2
 DEVICE_REGISTRY_CACHE_TTL = 60
 # areas are renamed even less often than devices, and only ever supply a label
 AREA_REGISTRY_CACHE_TTL = 60
+# floors and labels change as rarely as areas and serve the same purpose
+FLOOR_REGISTRY_CACHE_TTL = 60
+LABEL_REGISTRY_CACHE_TTL = 60
 
 SEARCH_CONTROL_ENTITIES_COMMAND = f"{DOMAIN}/search_control_entities"
+PLAYER_LOCATIONS_COMMAND = f"{DOMAIN}/player_locations"
+SPEAKER_LIST_COMMAND = f"{DOMAIN}/speaker_list"
+# clients hear of a changed speaker list through a provider event under this sub scope
+SPEAKER_LIST_EVENT_SCOPE = "speaker_list"
+# window to collect changes in, so a burst of player or registry updates sends one event
+SPEAKER_LIST_DEBOUNCE = 1.0
+# Home Assistant registry events that can move a player to another area, floor or label,
+# with the cached listing each one makes stale
+LOCATION_REGISTRY_EVENTS: Final = {
+    "device_registry_updated": "_fetch_device_registry",
+    "area_registry_updated": "_fetch_area_registry",
+    "floor_registry_updated": "_fetch_floor_registry",
+    "label_registry_updated": "_fetch_label_registry",
+}
+# the integration domain under which Home Assistant's Music Assistant integration
+# registers a device (and its media_player entity) for every Music Assistant player
+HASS_MUSIC_ASSISTANT_DOMAIN = "music_assistant"
 
 # HA paths a media player's entity_picture points at, the only images this provider resolves
 IMAGE_PATH_PREFIXES: Final = (
@@ -136,7 +163,7 @@ FEATURE_DOMAIN_PREFIXES = tuple(f"{domain}." for domain in FEATURE_DOMAINS)
 # config_entry_id joins them because Home Assistant can clear disabled_by while reporting
 # only the move to the other config entry.
 REGISTRY_FIELDS_AFFECTING_MIRROR = frozenset(
-    {"entity_id", "platform", "device_id", "area_id", "disabled_by", "config_entry_id"}
+    {"entity_id", "platform", "device_id", "area_id", "labels", "disabled_by", "config_entry_id"}
 )
 
 
@@ -160,6 +187,28 @@ class HassRegistryEntity(NamedTuple):
     device_id: str | None
     # the area the entity is assigned to directly, overriding the one of its device
     area_id: str | None
+    # the ids of the labels on the entity itself, not those on its device
+    labels: tuple[str, ...] = ()
+
+
+class HassPlayerLocation(TypedDict):
+    """Where a Music Assistant player is placed in Home Assistant, by name."""
+
+    area: str | None
+    floor: str | None
+    floor_level: int | None
+    # the labels on the player's entity and on its device, sorted by name
+    labels: list[str]
+
+
+class HassPlayerLocations(TypedDict):
+    """Result of the player locations command, keyed by player ID."""
+
+    # how the household wants speaker lists grouped, as set in the provider settings
+    grouping: Literal["floor", "area", "label", "none"]
+    players: dict[str, HassPlayerLocation]
+    # the colour of every sync group the user can see the leader of, keyed by leader ID
+    group_colours: dict[str, str]
 
 
 async def setup(
@@ -181,6 +230,20 @@ def _control_config_entries() -> tuple[ConfigEntry, ...]:
             category="player_controls",
         )
         for conf_key in (CONF_POWER_CONTROLS, CONF_VOLUME_CONTROLS, CONF_MUTE_CONTROLS)
+    )
+
+
+def _grouping_config_entry() -> ConfigEntry:
+    """Return the config entry holding how speaker lists group the players."""
+    return ConfigEntry(
+        key=CONF_PLAYER_GROUPING,
+        type=ConfigEntryType.STRING,
+        label=CONF_PLAYER_GROUPING,
+        options=[ConfigValueOption(grouping) for grouping in PLAYER_GROUPINGS],
+        default_value=DEFAULT_PLAYER_GROUPING,
+        required=False,
+        # applied in place by update_config, without reconnecting to Home Assistant
+        requires_reload=False,
     )
 
 
@@ -207,6 +270,15 @@ class HomeAssistantProvider(PluginProvider):
     _control_reconcile_lock: asyncio.Lock
     _control_entity_search: ControlEntitySearch
     _unregister_search_command: Callable[[], None] | None = None
+    _unregister_locations_command: Callable[[], None] | None = None
+    _unsubscribe_player_events: Callable[[], None] | None = None
+    _group_colours: GroupColours | None = None
+    _unregister_speaker_list_command: Callable[[], None] | None = None
+    _unsubscribe_location_registries: list[Callable[[], None]] | None = None
+    # bumped (and announced) whenever the speaker list may look different
+    _speaker_list_revision: int = 0
+    # what the speaker list was last built from, to tell a relevant player change apart
+    _speaker_list_players: frozenset[tuple[Any, ...]] | None = None
 
     @property
     def url(self) -> str | None:
@@ -265,7 +337,7 @@ class HomeAssistantProvider(PluginProvider):
             # url/token/verify_ssl are collected by the setup flow instead (see setup_flow.py)
             base_entries = ()
 
-        return (*base_entries, *_control_config_entries())
+        return (*base_entries, *_control_config_entries(), _grouping_config_entry())
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the plugin."""
@@ -289,13 +361,9 @@ class HomeAssistantProvider(PluginProvider):
         self._entity_registry = None
         self._entity_registry_lock = asyncio.Lock()
         self._control_entity_search = ControlEntitySearch(self)
-        # registering here rather than in loaded_in_mass pairs the command with the teardown
-        # in _disconnect_hass, so a reload can never leave it registered twice
-        self._unregister_search_command = self.mass.register_api_command(
-            SEARCH_CONTROL_ENTITIES_COMMAND,
-            self.search_control_entities,
-            required_scope=Scope.CONFIG_PROVIDERS_READ,
-        )
+        # registering here rather than in loaded_in_mass pairs the commands with the teardown
+        # in _disconnect_hass, so a reload can never leave them registered twice
+        self._register_api_commands()
         try:
             await self.hass.connect()
         except asyncio.CancelledError:
@@ -311,6 +379,7 @@ class HomeAssistantProvider(PluginProvider):
             # registry change can slip through unnoticed; _disconnect_hass tears the
             # subscription down again on the failure paths below
             await self._subscribe_entity_registry()
+            await self._subscribe_location_registries()
             await self._resolve_startup_features()
         except asyncio.CancelledError:
             await self._cleanup_failed_init()
@@ -344,9 +413,10 @@ class HomeAssistantProvider(PluginProvider):
         """
         Handle logic when the config is updated.
 
-        A change limited to the player control selection is applied in place, so adding or
-        removing a control does not drop and re-establish the Home Assistant connection.
-        Any other change reloads the provider as usual.
+        A change limited to the player control selection and the player grouping is applied
+        in place, so adding or removing a control, or picking another grouping, does not drop
+        and re-establish the Home Assistant connection. Any other change reloads the provider
+        as usual.
 
         Raises when the in place update fails (because Home Assistant is unreachable, for
         example); the controls are then left as they were and a later update retries.
@@ -358,12 +428,17 @@ class HomeAssistantProvider(PluginProvider):
             f"values/{conf_key}"
             for conf_key in (CONF_POWER_CONTROLS, CONF_VOLUME_CONTROLS, CONF_MUTE_CONTROLS)
         }
-        if not changed_keys or not changed_keys <= control_keys:
+        in_place_keys = {*control_keys, f"values/{CONF_PLAYER_GROUPING}"}
+        if not changed_keys or not changed_keys <= in_place_keys:
             await super().update_config(config, changed_keys)
             return
-        # store the new config before reconciling: the control lists are read back from it
+        # store the new config before reconciling: the control lists are read back from it,
+        # and the grouping is read from it whenever the locations are asked for
         self.config = config
-        await self._register_player_controls()
+        if f"values/{CONF_PLAYER_GROUPING}" in changed_keys:
+            self._speaker_list_changed()
+        if changed_keys & control_keys:
+            await self._register_player_controls()
 
     async def get_diagnostics(self) -> dict[str, SerializableType]:
         """Return diagnostics info for this provider to include in diagnostics reports."""
@@ -432,6 +507,24 @@ class HomeAssistantProvider(PluginProvider):
         AREA_REGISTRY_CACHE_TTL seconds to be reflected.
         """
         return await self._fetch_area_registry()
+
+    async def get_floor_registry(self) -> dict[str, dict[str, Any]]:
+        """
+        Return the Home Assistant floor registry, keyed by floor ID.
+
+        The listing is reused for a short while, so a floor change may take up to
+        FLOOR_REGISTRY_CACHE_TTL seconds to be reflected.
+        """
+        return await self._fetch_floor_registry()
+
+    async def get_label_registry(self) -> dict[str, dict[str, Any]]:
+        """
+        Return the Home Assistant label registry, keyed by label ID.
+
+        The listing is reused for a short while, so a label change may take up to
+        LABEL_REGISTRY_CACHE_TTL seconds to be reflected.
+        """
+        return await self._fetch_label_registry()
 
     async def search_control_entities(
         self,
@@ -648,6 +741,92 @@ class HomeAssistantProvider(PluginProvider):
         except Exception as err:
             self.logger.warning("Failed to get HA user details: %s", err)
             return None, None, None
+
+    async def get_player_locations(self) -> HassPlayerLocations:
+        """
+        Return where each Music Assistant player is placed in Home Assistant.
+
+        Home Assistant's Music Assistant integration registers a device for every player,
+        identified by the player ID, with a media_player entity on it. The player's area is
+        the one assigned to that entity, or else the one of its device, and its floor is the
+        floor of that area. Its labels are those on the entity and on the device.
+
+        Every player the current user can see is listed. Where Home Assistant has nothing,
+        such as a player without a device in Home Assistant or a device without an area, the
+        fields are None or an empty list. Registry changes can take up to a minute to show.
+        """
+        if not self.hass.connected:
+            msg = "Home Assistant is not connected"
+            raise ProviderUnavailableError(msg)
+        entity_registry, devices, areas, floors, labels = await asyncio.gather(
+            self.get_entity_registry(),
+            self.get_device_registry(),
+            self.get_area_registry(),
+            self.get_floor_registry(),
+            self.get_label_registry(),
+        )
+        device_by_player: dict[str, Mapping[str, Any]] = {}
+        for device in devices.values():
+            for domain, identifier in device.get("identifiers") or ():
+                if domain == HASS_MUSIC_ASSISTANT_DOMAIN:
+                    device_by_player[identifier] = cast("Mapping[str, Any]", device)
+        # other integrations expose the same hardware as separate, unlinked devices, so
+        # only the entities of the Music Assistant integration itself are considered
+        entity_by_device = {
+            entry.device_id: entry
+            for entity_id, entry in entity_registry.items()
+            if entry.platform == HASS_MUSIC_ASSISTANT_DOMAIN
+            and entry.device_id is not None
+            and entity_id.startswith("media_player.")
+        }
+        locations: dict[str, HassPlayerLocation] = {}
+        for player in self.mass.players.all_players():
+            device = device_by_player.get(player.player_id)
+            entity = entity_by_device.get(device["id"]) if device else None
+            locations[player.player_id] = _player_location(
+                device, entity, cast("Mapping[str, Mapping[str, Any]]", areas), floors, labels
+            )
+        # the colours are worked out over every player, so all users agree on them, but
+        # only the groups whose leader this user can see are handed out
+        colours = self._refresh_group_colours().colours
+        return {
+            "grouping": self._player_grouping(),
+            "players": locations,
+            "group_colours": {
+                leader_id: colour for leader_id, colour in colours.items() if leader_id in locations
+            },
+        }
+
+    async def get_speaker_list(self) -> SpeakerList:
+        """
+        Return the finished speaker list for the current user, for clients to draw as is.
+
+        The players are sorted into sections by the household's grouping (floor, area,
+        label or none), with "Other" last. Hidden, disabled, protocol and source players
+        are left out, and so are the rooms a permanent group player stands in for; the
+        group player itself is listed as a room. The caller's own client player (such as
+        its web player) is listed even while hidden. Groups made on the fly carry their
+        colour, and their members name their leader.
+
+        Clients are told of a change by a provider event under the sub scope
+        "speaker_list", carrying the new revision, and then ask again.
+        """
+        locations = await self.get_player_locations()
+        everyone = list(self.mass.players.iter_players())
+        visible = self.mass.players.all_players()
+        group_colours = self._refresh_group_colours()
+        return build_speaker_list(
+            visible=visible,
+            everyone=everyone,
+            locations=locations["players"],
+            grouping=locations["grouping"],
+            groups=groups_from_players(everyone),
+            colours=group_colours.colours,
+            revision=self._speaker_list_revision,
+            own_player_id=next(
+                (player.player_id for player in visible if is_own_client_player(player)), None
+            ),
+        )
 
     async def get_states(
         self,
@@ -1180,6 +1359,18 @@ class HomeAssistantProvider(PluginProvider):
         if unregister := self._unregister_search_command:
             self._unregister_search_command = None
             unregister()
+        if unregister := self._unregister_locations_command:
+            self._unregister_locations_command = None
+            unregister()
+        if unregister := self._unregister_speaker_list_command:
+            self._unregister_speaker_list_command = None
+            unregister()
+        for unsubscribe_registry in self._unsubscribe_location_registries or ():
+            unsubscribe_registry()
+        self._unsubscribe_location_registries = None
+        if unsubscribe := self._unsubscribe_player_events:
+            self._unsubscribe_player_events = None
+            unsubscribe()
         self._control_entity_search.close()
         if unsubscribe := self._unsubscribe_controls:
             self._unsubscribe_controls = None
@@ -1317,6 +1508,8 @@ class HomeAssistantProvider(PluginProvider):
         if _affects_mirrored_registry(data):
             self._entity_registry = None
             self._entity_registry_generation += 1
+            # an entity's area or labels may have changed
+            self._speaker_list_changed()
         elif self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
             # the kept mirror rests on which fields Home Assistant reports, so leave a
             # trail that tells a stale entity listing apart from a lookup that never ran
@@ -1373,6 +1566,8 @@ class HomeAssistantProvider(PluginProvider):
                 platform=intern(entry["pl"]),
                 device_id=device_id,
                 area_id=area_id,
+                # a handful of labels is spread over many entities, so share their ids too
+                labels=tuple(intern(label_id) for label_id in entry.get("lb") or ()),
             )
         return MappingProxyType(registry)
 
@@ -1395,6 +1590,121 @@ class HomeAssistantProvider(PluginProvider):
         # the Area TypedDict; get_area_registry restores the type for callers
         return {area["area_id"]: area for area in await self.hass.get_area_registry()}
 
+    @lock
+    @use_cache(expiration=FLOOR_REGISTRY_CACHE_TTL)
+    async def _fetch_floor_registry(self) -> dict[str, Any]:
+        """Fetch the floor registry from Home Assistant, keyed by floor ID."""
+        floors = cast(
+            "list[dict[str, Any]]", await self.hass.send_command("config/floor_registry/list")
+        )
+        return {floor["floor_id"]: floor for floor in floors}
+
+    @lock
+    @use_cache(expiration=LABEL_REGISTRY_CACHE_TTL)
+    async def _fetch_label_registry(self) -> dict[str, Any]:
+        """Fetch the label registry from Home Assistant, keyed by label ID."""
+        labels = cast(
+            "list[dict[str, Any]]", await self.hass.send_command("config/label_registry/list")
+        )
+        return {label["label_id"]: label for label in labels}
+
+    def _register_api_commands(self) -> None:
+        """Expose the provider's API commands and follow the players for them."""
+        self._unregister_search_command = self.mass.register_api_command(
+            SEARCH_CONTROL_ENTITIES_COMMAND,
+            self.search_control_entities,
+            required_scope=Scope.CONFIG_PROVIDERS_READ,
+        )
+        # any signed-in user may see where the players they can see are placed
+        self._unregister_locations_command = self.mass.register_api_command(
+            PLAYER_LOCATIONS_COMMAND,
+            self.get_player_locations,
+            required_scope=Scope.PLAYERS_READ,
+        )
+        self._unregister_speaker_list_command = self.mass.register_api_command(
+            SPEAKER_LIST_COMMAND,
+            self.get_speaker_list,
+            required_scope=Scope.PLAYERS_READ,
+        )
+        # follow the sync groups as they change, so a group that changes leader between
+        # two requests for the locations still keeps its colour
+        self._group_colours = GroupColours()
+        self._unsubscribe_player_events = self.mass.subscribe(
+            self._on_player_event,
+            (EventType.PLAYER_ADDED, EventType.PLAYER_UPDATED, EventType.PLAYER_REMOVED),
+        )
+
+    async def _subscribe_location_registries(self) -> None:
+        """Watch the Home Assistant registries that place players, for the speaker list."""
+        for unsubscribe_registry in self._unsubscribe_location_registries or ():
+            unsubscribe_registry()
+        self._unsubscribe_location_registries = [
+            await self.hass.subscribe_events(self._on_location_registry_update, event_type)
+            for event_type in LOCATION_REGISTRY_EVENTS
+        ]
+
+    def _on_location_registry_update(self, event: Event) -> None:
+        """Drop the stale registry listing and announce a changed speaker list."""
+        if cache_key := LOCATION_REGISTRY_EVENTS.get(event["event_type"]):
+            self.mass.create_task(self.mass.cache.delete(cache_key, provider=self.instance_id))
+        self._speaker_list_changed()
+
+    def _on_player_event(self, event: MassEvent) -> None:
+        """Follow a change to the players, which may start, change or end a sync group."""
+        self._refresh_group_colours()
+        # most player updates (volume, position) leave the speaker list as it is
+        players = frozenset(
+            (
+                state.player_id,
+                state.name,
+                state.type,
+                state.enabled,
+                state.available,
+                state.hide_in_ui,
+                state.private,
+                tuple(state.group_members),
+                tuple(state.static_group_members),
+                state.synced_to,
+                state.active_group,
+                tuple(sorted(state.can_group_with)),
+            )
+            for state in (player.state for player in self.mass.players.iter_players())
+        )
+        if players != self._speaker_list_players:
+            self._speaker_list_players = players
+            self._speaker_list_changed()
+
+    def _speaker_list_changed(self) -> None:
+        """Announce a changed speaker list once the current burst of changes is over."""
+        self.mass.call_later(
+            SPEAKER_LIST_DEBOUNCE,
+            self._signal_speaker_list,
+            task_id=f"{self.instance_id}.{SPEAKER_LIST_EVENT_SCOPE}",
+        )
+
+    def _signal_speaker_list(self) -> None:
+        """Bump the speaker list revision and tell the clients to ask again."""
+        self._speaker_list_revision += 1
+        self.signal_provider_event(
+            {"revision": self._speaker_list_revision}, sub_scope=SPEAKER_LIST_EVENT_SCOPE
+        )
+
+    def _refresh_group_colours(self) -> GroupColours:
+        """Bring the group colours in line with the sync groups as they are now."""
+        if self._group_colours is None:
+            self._group_colours = GroupColours()
+        self._group_colours.update(groups_from_players(self.mass.players.iter_players()))
+        return self._group_colours
+
+    def _player_grouping(self) -> Literal["floor", "area", "label", "none"]:
+        """Return the configured player grouping, falling back to none for an unknown value."""
+        grouping = self.config.get_value(CONF_PLAYER_GROUPING, DEFAULT_PLAYER_GROUPING)
+        if grouping not in PLAYER_GROUPINGS:
+            # a hand-edited setting, or one a later version added, is not passed on as is:
+            # clients only know these four
+            grouping = DEFAULT_PLAYER_GROUPING
+        return cast("Literal['floor', 'area', 'label', 'none']", grouping)
+
 
 def _supports_image_generation(state: State) -> bool:
     """Return whether an ai_task entity state advertises image generation."""
@@ -1402,6 +1712,41 @@ def _supports_image_generation(state: State) -> bool:
     if not isinstance(raw_value, int) or isinstance(raw_value, bool):
         return False
     return AITaskEntityFeature.GENERATE_IMAGE in AITaskEntityFeature(raw_value)
+
+
+def _player_location(
+    device: Mapping[str, Any] | None,
+    entity: HassRegistryEntity | None,
+    areas: Mapping[str, Mapping[str, Any]],
+    floors: Mapping[str, Mapping[str, Any]],
+    labels: Mapping[str, Mapping[str, Any]],
+) -> HassPlayerLocation:
+    """
+    Return the location of a player from its Home Assistant device and media_player entity.
+
+    :param device: The player's device, or None when Home Assistant has none for it.
+    :param entity: The media_player entity on that device, or None when it has none.
+    :param areas: The area registry, keyed by area ID.
+    :param floors: The floor registry, keyed by floor ID.
+    :param labels: The label registry, keyed by label ID.
+    """
+    # an area assigned to the entity overrides the one of its device
+    area_id = (entity.area_id if entity else None) or (device.get("area_id") if device else None)
+    area = areas.get(area_id) if area_id else None
+    floor_id = area.get("floor_id") if area else None
+    floor = floors.get(floor_id) if floor_id else None
+    label_ids = {
+        *(entity.labels if entity else ()),
+        *((device.get("labels") or ()) if device else ()),
+    }
+    # ids the label registry does not know (yet) are left out rather than shown as an id
+    label_names = {labels[label_id]["name"] for label_id in label_ids if label_id in labels}
+    return {
+        "area": area["name"] if area else None,
+        "floor": floor["name"] if floor else None,
+        "floor_level": floor.get("level") if floor else None,
+        "labels": sorted(label_names, key=str.casefold),
+    }
 
 
 def _affects_mirrored_registry(data: Mapping[str, Any]) -> bool:
@@ -1414,7 +1759,7 @@ def _affects_mirrored_registry(data: Mapping[str, Any]) -> bool:
         # a created or removed entity always enters or leaves the listing
         return True
     # an update reports the fields it touched, so a change that only concerns fields we do
-    # not mirror (a rename, an icon, a label) leaves our listing accurate. an update can also
+    # not mirror (a rename, an icon) leaves our listing accurate. an update can also
     # report no fields at all, as a device rename re-derives a name field that Home Assistant
     # strips from the report, so treat that as a change of unknown reach
     if not (changes := data.get("changes")):
