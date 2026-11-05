@@ -250,7 +250,7 @@ async def test_a_changed_device_map_triggers_re_enrichment() -> None:
 async def test_refresh_includes_players_with_an_announced_device_id() -> None:
     """A player with no reported MAC is still refreshed when HA announced its device id."""
     player = _player(player_id="jyu3dS9mC2xHq0yGm7Hn3oUuZz8kPq1wLr5tXv0aB4c")
-    player.update_state = Mock()  # type: ignore[method-assign]
+    player.update_state = Mock()  # type: ignore[method-assign,misc]
     provider = _provider(_hass_provider({}))
     provider._hass_sendspin_devices = {player.player_id: "dev1"}
     apply = AsyncMock()

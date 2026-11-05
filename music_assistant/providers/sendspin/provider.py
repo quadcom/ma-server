@@ -1214,6 +1214,13 @@ class SendspinProvider(PlayerProvider):
             return_exceptions=True,
         )
 
+    def set_hass_sendspin_devices(self, devices: dict[str, str]) -> None:
+        """Store the HA device ids of Sendspin clients and re-enrich players when they change."""
+        if devices == self._hass_sendspin_devices:
+            return
+        self._hass_sendspin_devices = devices
+        self.mass.create_task(self._refresh_hass_esphome_enrichment())
+
     def _set_aiosendspin_log_level(self) -> None:
         """Keep aiosendspin's (very chatty) logging quiet unless verbose logging is enabled."""
         # aiosendspin logs every protocol message of every client session at debug
@@ -1302,13 +1309,6 @@ class SendspinProvider(PlayerProvider):
                 player.set_hass_announce_entity(
                     device_info["announce_entity_id"] if device_info is not None else None
                 )
-
-    def set_hass_sendspin_devices(self, devices: dict[str, str]) -> None:
-        """Store the HA device ids of Sendspin clients and re-enrich players when they change."""
-        if devices == self._hass_sendspin_devices:
-            return
-        self._hass_sendspin_devices = devices
-        self.mass.create_task(self._refresh_hass_esphome_enrichment())
 
     async def _refresh_hass_esphome_enrichment(self) -> None:
         """Re-apply the HA enrichment to registered players with a MAC address or HA device id (in place)."""
