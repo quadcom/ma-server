@@ -38,11 +38,13 @@ from music_assistant_models.enums import (
     ContentType,
     EventType,
     MediaType,
+    PlayerType,
     ProviderFeature,
     StreamType,
 )
 from music_assistant_models.errors import (
     MusicAssistantError,
+    PlayerCommandFailed,
     ProviderUnavailableError,
     RateLimited,
     SetupFailedError,
@@ -52,7 +54,7 @@ from music_assistant_models.media_items.audio_format import AudioFormat
 from music_assistant_models.player_control import PlayerControl
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant.constants import CONF_VERIFY_SSL, VERBOSE_LOG_LEVEL
+from music_assistant.constants import CONF_GROUP_MEMBERS, CONF_VERIFY_SSL, VERBOSE_LOG_LEVEL
 from music_assistant.controllers.cache import use_cache
 from music_assistant.controllers.webserver.helpers.auth_middleware import is_own_client_player
 from music_assistant.helpers.datetime import iso_from_utc_timestamp
@@ -80,7 +82,7 @@ from .control_entities import (
 )
 from .group_colours import GroupColours, groups_from_players
 from .helpers import ControlCapabilities, get_control_name, is_entity_id
-from .speaker_list import SpeakerList, build_speaker_list
+from .speaker_list import SpeakerList, build_speaker_list, permanent_group_rooms
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping
@@ -104,6 +106,7 @@ if TYPE_CHECKING:
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
+    from music_assistant.models.player import Player
 
 DOMAIN = "hass"
 CONF_URL = "url"
@@ -126,6 +129,11 @@ LABEL_REGISTRY_CACHE_TTL = 60
 SEARCH_CONTROL_ENTITIES_COMMAND = f"{DOMAIN}/search_control_entities"
 PLAYER_LOCATIONS_COMMAND = f"{DOMAIN}/player_locations"
 SPEAKER_LIST_COMMAND = f"{DOMAIN}/speaker_list"
+SPEAKER_LIST_SET_MEMBERS_COMMAND = f"{DOMAIN}/speaker_list/set_members"
+# how long a permanent group's ended session may take to let go of its rooms, and how often
+# to look, before they join another group
+GROUP_RELEASE_TIMEOUT = 5.0
+GROUP_RELEASE_POLL = 0.2
 # clients hear of a changed speaker list through a provider event under this sub scope
 SPEAKER_LIST_EVENT_SCOPE = "speaker_list"
 # window to collect changes in, so a burst of player or registry updates sends one event
@@ -274,6 +282,7 @@ class HomeAssistantProvider(PluginProvider):
     _unsubscribe_player_events: Callable[[], None] | None = None
     _group_colours: GroupColours | None = None
     _unregister_speaker_list_command: Callable[[], None] | None = None
+    _unregister_speaker_list_members_command: Callable[[], None] | None = None
     _unsubscribe_location_registries: list[Callable[[], None]] | None = None
     # bumped (and announced) whenever the speaker list may look different
     _speaker_list_revision: int = 0
@@ -806,7 +815,9 @@ class HomeAssistantProvider(PluginProvider):
         are left out, and so are the rooms a permanent group player stands in for; the
         group player itself is listed as a room. The caller's own client player (such as
         its web player) is listed even while hidden. Groups made on the fly carry their
-        colour, and their members name their leader.
+        colour, and their members name their leader. A permanent group counts as one room
+        there too: it is offered to other groups, shows as one member when its rooms join
+        one, and as the leader when one of its rooms leads (see set_speaker_list_members).
 
         Clients are told of a change by a provider event under the sub scope
         "speaker_list", carrying the new revision, and then ask again.
@@ -826,6 +837,72 @@ class HomeAssistantProvider(PluginProvider):
             own_player_id=next(
                 (player.player_id for player in visible if is_own_client_player(player)), None
             ),
+            group_rooms={
+                player.player_id: self._configured_group_rooms(player.player_id)
+                for player in everyone
+                if player.state.type == PlayerType.GROUP
+            },
+        )
+
+    async def set_speaker_list_members(
+        self,
+        target_player: str,
+        player_ids_to_add: list[str] | None = None,
+        player_ids_to_remove: list[str] | None = None,
+    ) -> None:
+        """
+        Join or take out rooms of the speaker list to or from the target player's group.
+
+        Takes the arguments of players/cmd/set_members, with the rooms as the speaker list
+        names them. There a permanent group (a group player, such as a sync group) is one
+        room, but MA core never puts a group player inside another player's group, so a
+        permanent group joins and leaves as the rooms it is set up with. One playing on its
+        own ends that session first, and a room of it that is offline is left out.
+
+        :param target_player: player_id of the group's leader.
+        :param player_ids_to_add: The rooms to add to the leader's group.
+        :param player_ids_to_remove: The rooms to take out of the leader's group.
+        """
+        players = self.mass.players
+        to_add: list[str] = []
+        for player_id in player_ids_to_add or ():
+            group_player = players.get_player(player_id)
+            if (
+                group_player is None
+                or group_player.state.type != PlayerType.GROUP
+                or player_id == target_player
+            ):
+                to_add.append(player_id)
+                continue
+            rooms = self._group_rooms(group_player)
+            if any(
+                (room := players.get_player(room_id)) is not None
+                and room.state.active_group == player_id
+                for room_id in rooms
+            ):
+                # it plays on its own: end that session so its rooms are free to join
+                await players.cmd_ungroup(player_id)
+                await self._wait_rooms_released(player_id, rooms)
+            to_add.extend(
+                room_id
+                for room_id in rooms
+                if (room := players.get_player(room_id)) is not None and room.state.available
+            )
+        to_remove: list[str] = []
+        for player_id in player_ids_to_remove or ():
+            group_player = players.get_player(player_id)
+            if (
+                group_player is None
+                or group_player.state.type != PlayerType.GROUP
+                or player_id == target_player
+            ):
+                to_remove.append(player_id)
+            else:
+                to_remove.extend(self._group_rooms(group_player))
+        await players.cmd_set_members(
+            target_player,
+            player_ids_to_add=list(dict.fromkeys(to_add)) or None,
+            player_ids_to_remove=list(dict.fromkeys(to_remove)) or None,
         )
 
     async def get_states(
@@ -1365,6 +1442,9 @@ class HomeAssistantProvider(PluginProvider):
         if unregister := self._unregister_speaker_list_command:
             self._unregister_speaker_list_command = None
             unregister()
+        if unregister := self._unregister_speaker_list_members_command:
+            self._unregister_speaker_list_members_command = None
+            unregister()
         for unsubscribe_registry in self._unsubscribe_location_registries or ():
             unsubscribe_registry()
         self._unsubscribe_location_registries = None
@@ -1626,6 +1706,12 @@ class HomeAssistantProvider(PluginProvider):
             self.get_speaker_list,
             required_scope=Scope.PLAYERS_READ,
         )
+        # changes groups, so it needs the same right as players/cmd/set_members
+        self._unregister_speaker_list_members_command = self.mass.register_api_command(
+            SPEAKER_LIST_SET_MEMBERS_COMMAND,
+            self.set_speaker_list_members,
+            required_scope=Scope.PLAYERS_CONTROL,
+        )
         # follow the sync groups as they change, so a group that changes leader between
         # two requests for the locations still keeps its colour
         self._group_colours = GroupColours()
@@ -1704,6 +1790,42 @@ class HomeAssistantProvider(PluginProvider):
             # clients only know these four
             grouping = DEFAULT_PLAYER_GROUPING
         return cast("Literal['floor', 'area', 'label', 'none']", grouping)
+
+    def _configured_group_rooms(self, group_id: str) -> list[str] | None:
+        """Return the rooms a group player is set up with, or None if it has no such setting."""
+        configured = self.mass.config.get_raw_player_config_value(group_id, CONF_GROUP_MEMBERS)
+        if not isinstance(configured, list):
+            return None
+        return [str(room_id) for room_id in configured]
+
+    def _group_rooms(self, group_player: Player) -> list[str]:
+        """Return the rooms a permanent group stands in for, as the speaker list has them."""
+        return permanent_group_rooms(
+            group_player, self._configured_group_rooms(group_player.player_id)
+        )
+
+    async def _wait_rooms_released(self, group_id: str, room_ids: list[str]) -> None:
+        """
+        Wait a little for a permanent group's ended session to let go of its rooms.
+
+        :param group_id: The permanent group whose session was ended.
+        :param room_ids: The rooms it is set up with.
+        """
+        try:
+            async with asyncio.timeout(GROUP_RELEASE_TIMEOUT):
+                while any(
+                    (room := self.mass.players.get_player(room_id)) is not None
+                    and (
+                        room.state.active_group == group_id
+                        or (room.state.synced_to is not None and room.state.synced_to in room_ids)
+                    )
+                    for room_id in room_ids
+                ):
+                    await asyncio.sleep(GROUP_RELEASE_POLL)
+        except TimeoutError as err:
+            # nothing was added yet, so the group is not half joined
+            msg = f"Group {group_id} did not let go of its rooms in time"
+            raise PlayerCommandFailed(msg) from err
 
 
 def _supports_image_generation(state: State) -> bool:

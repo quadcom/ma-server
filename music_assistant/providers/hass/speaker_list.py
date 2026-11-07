@@ -84,6 +84,7 @@ def build_speaker_list(
     colours: Mapping[str, str],
     revision: int,
     own_player_id: str | None = None,
+    group_rooms: Mapping[str, list[str] | None] | None = None,
 ) -> SpeakerList:
     """
     Build the speaker list one user sees.
@@ -97,19 +98,23 @@ def build_speaker_list(
     :param revision: The revision to report, which changes whenever the list may have.
     :param own_player_id: The private client player the caller connected on (such as its
         web player), listed even while hidden, as the client shows it as "this device".
+    :param group_rooms: The rooms each group player is set up with, keyed by its ID. A
+        group that takes in more rooms as it plays (a dynamic sync group) keeps them only
+        in its settings, not in its state.
     """
     visible_players = {player.player_id: player for player in visible}
-    group_players = [player for player in everyone if player.state.type == PlayerType.GROUP]
-    # the rooms a permanent group stands in for never show on their own
-    swallowed = {
-        member_id
-        for group_player in group_players
-        for member_id in (
-            *group_player.state.group_members,
-            *group_player.state.static_group_members,
+    everyone_by_id = {player.player_id: player for player in everyone}
+    group_players = [
+        player for player in everyone_by_id.values() if player.state.type == PlayerType.GROUP
+    ]
+    rooms_of = {
+        group_player.player_id: permanent_group_rooms(
+            group_player, (group_rooms or {}).get(group_player.player_id)
         )
-        if member_id != group_player.player_id
+        for group_player in group_players
     }
+    # the rooms a permanent group stands in for never show on their own
+    swallowed = {member_id for member_ids in rooms_of.values() for member_id in member_ids}
     listed = [
         player
         for player in visible_players.values()
@@ -119,12 +124,23 @@ def build_speaker_list(
         and player.player_id not in swallowed
     ]
     listed_ids = {player.player_id for player in listed}
+    # a listed permanent group stands in for its rooms, in the groups made on the fly too
+    group_of = {
+        member_id: group_player.player_id
+        for group_player in group_players
+        if group_player.player_id in listed_ids
+        for member_id in rooms_of[group_player.player_id]
+    }
+    groups, colours = _groups_as_rooms(groups, colours, group_of)
     leader_of = {
         member_id: leader_id
         for leader_id, member_ids in groups.items()
         for member_id in member_ids
         if leader_id in listed_ids
     }
+    permanent = [
+        group_player for group_player in group_players if group_player.player_id in listed_ids
+    ]
 
     def _name_key(player_id: str) -> tuple[str, str]:
         player = visible_players.get(player_id)
@@ -143,7 +159,9 @@ def build_speaker_list(
             "group_leader": leader_of.get(player.player_id),
             "is_permanent_group": player.state.type == PlayerType.GROUP,
             "group_with": sorted(
-                _group_with(player, visible_players, swallowed, groups), key=_name_key
+                _group_with(player, visible_players, swallowed, groups)
+                | _permanent_groups_to_offer(player, permanent, rooms_of, everyone_by_id, groups),
+                key=_name_key,
             ),
         }
     return {
@@ -164,17 +182,9 @@ def build_speaker_list(
             {
                 "player": player.player_id,
                 "name": _name(player),
-                "members": sorted(
-                    {
-                        m
-                        for m in (*player.state.group_members, *player.state.static_group_members)
-                        if m != player.player_id
-                    },
-                    key=_name_key,
-                ),
+                "members": sorted(rooms_of[player.player_id], key=_name_key),
             }
-            for player in sorted(group_players, key=lambda p: _name_key(p.player_id))
-            if player.player_id in listed_ids
+            for player in sorted(permanent, key=lambda p: _name_key(p.player_id))
         ],
     }
 
@@ -213,6 +223,129 @@ def _group_with(
         ):
             offered.add(player_id)
     return offered
+
+
+def permanent_group_rooms(group_player: Player, configured: list[str] | None) -> list[str]:
+    """
+    Return the rooms a permanent group stands in for: the rooms it is set up with.
+
+    Its live members also hold the rooms it leads for the moment, which stay rooms of their
+    own. Only when its setup is unknown are its fixed rooms, or failing those its live
+    members, taken instead.
+    """
+    state = group_player.state
+    member_ids = configured or state.static_group_members or state.group_members
+    return [
+        member_id for member_id in dict.fromkeys(member_ids) if member_id != group_player.player_id
+    ]
+
+
+def _groups_as_rooms(
+    groups: Mapping[str, set[str]],
+    colours: Mapping[str, str],
+    group_of: Mapping[str, str],
+) -> tuple[dict[str, set[str]], dict[str, str]]:
+    """
+    Return the groups made on the fly, with each permanent group's rooms shown as that group.
+
+    A permanent group joins another group as its rooms (MA core never puts a group player
+    inside another player's group), so those rooms become one member, the permanent group.
+    A group led by one of its rooms (the permanent group leading others through its sync
+    leader, or core handing the lead to such a room) is led by the permanent group, in the
+    same colour. A group left with no other member is no group made on the fly.
+
+    :param groups: The groups made on the fly, as leader ID to member IDs.
+    :param colours: The colour of each group made on the fly, keyed by leader ID.
+    :param group_of: The listed permanent group each of their rooms belongs to.
+    """
+    as_rooms: dict[str, set[str]] = {}
+    as_rooms_colours: dict[str, str] = {}
+    for leader_id, member_ids in groups.items():
+        leader = group_of.get(leader_id, leader_id)
+        members = {group_of.get(member_id, member_id) for member_id in member_ids} - {leader}
+        if not members:
+            continue
+        as_rooms.setdefault(leader, set()).update(members)
+        if leader_id in colours:
+            as_rooms_colours.setdefault(leader, colours[leader_id])
+    return as_rooms, as_rooms_colours
+
+
+def _permanent_groups_to_offer(
+    leader: Player,
+    permanent: Iterable[Player],
+    rooms_of: Mapping[str, list[str]],
+    everyone: Mapping[str, Player],
+    groups: Mapping[str, set[str]],
+) -> set[str]:
+    """
+    Return the permanent groups a group editor may offer to group with the given room.
+
+    A permanent group joins as its rooms, so it is offered when every one of its rooms that
+    is online may join the leader (a room that is offline doesn't block it). A permanent
+    group playing on its own is offered too, as joining ends that session, and so is one
+    already in the leader's group, so it can be taken out again. A group player never
+    leads another this way: its own list of rooms is fixed.
+    """
+    if leader.state.type == PlayerType.GROUP:
+        return set()
+    can_group_with = set(leader.state.can_group_with)
+    in_group = set(groups.get(leader.player_id, ()))
+    offered: set[str] = set()
+    for group_player in permanent:
+        group_id = group_player.player_id
+        state = group_player.state
+        if group_id in in_group:
+            offered.add(group_id)
+            continue
+        member_ids = rooms_of[group_id]
+        if (
+            leader.player_id in member_ids
+            or not state.enabled
+            or not state.available
+            or state.hide_in_ui
+        ):
+            continue
+        online = [
+            everyone[member_id]
+            for member_id in member_ids
+            if member_id in everyone and everyone[member_id].state.available
+        ]
+        if online and all(
+            _may_join(member, leader.player_id, group_id, member_ids, can_group_with)
+            for member in online
+        ):
+            offered.add(group_id)
+    return offered
+
+
+def _may_join(
+    member: Player,
+    leader_id: str,
+    group_id: str,
+    member_ids: list[str],
+    can_group_with: set[str],
+) -> bool:
+    """
+    Return whether a room of a permanent group may join the given leader's group.
+
+    It must be enabled and not held by any group but its own permanent group's or the
+    leader's. Core leaves a playing group leader out of every `can_group_with`, so the room
+    leading its own permanent group's session is judged when the group joins, once that
+    session has ended.
+    """
+    state = member.state
+    if not state.enabled:
+        return False
+    if state.active_group not in (None, group_id, leader_id):
+        return False
+    if state.synced_to and state.synced_to not in (leader_id, *member_ids):
+        return False
+    if member.player_id in can_group_with:
+        return True
+    return state.active_group == group_id and any(
+        member_id != member.player_id for member_id in state.group_members
+    )
 
 
 def _sections(

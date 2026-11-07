@@ -51,6 +51,7 @@ def _build(
     visible: list[Any] | None = None,
     groups: dict[str, set[str]] | None = None,
     colours: dict[str, str] | None = None,
+    group_rooms: dict[str, list[str]] | None = None,
 ) -> Any:
     return build_speaker_list(
         visible=visible if visible is not None else players,
@@ -60,6 +61,7 @@ def _build(
         groups=groups or {},
         colours=colours or {},
         revision=7,
+        group_rooms=group_rooms,
     )
 
 
@@ -188,7 +190,7 @@ def test_a_permanent_group_is_one_room_without_its_members() -> None:
             "Master Bedroom",
             player_type=PlayerType.GROUP,
             group_members=["bed1"],
-            static_group_members=["bed2"],
+            static_group_members=["bed1", "bed2"],
         ),
         _player("bed1", "Master Bedroom 1", hide_in_ui=True),
         _player("bed2", "Master Bedroom 2"),
@@ -287,3 +289,138 @@ def test_the_callers_own_hidden_player_is_listed() -> None:
         revision=1,
         own_player_id="off",
     )["rooms"].keys() == {"kitchen"}
+
+
+def _bedroom(**state: Any) -> list[Any]:
+    """Return a permanent group of two hidden rooms, like Master Bedroom (MB1 + MB2)."""
+    return [
+        _player(
+            "bedroom",
+            "Master Bedroom",
+            player_type=PlayerType.GROUP,
+            static_group_members=["bed1", "bed2"],
+            group_members=["bed1", "bed2"],
+        ),
+        _player("bed1", "Master Bedroom 1", hide_in_ui=True, **state),
+        _player("bed2", "Master Bedroom 2", hide_in_ui=True, **state),
+    ]
+
+
+def test_a_permanent_group_is_offered_as_one_room() -> None:
+    """Offer a permanent group whose rooms may all join the leader, never its rooms."""
+    players = [
+        *_bedroom(),
+        _player("bath", can_group_with=["bed1", "bed2", "deck"]),
+        _player("deck"),
+    ]
+    locations = {p.player_id: _at("Room", "Main", 1) for p in players}
+
+    result = _build(players, locations)
+
+    assert result["rooms"]["bath"]["group_with"] == ["deck", "bedroom"]
+    # a group player leads with its own fixed rooms, so it is offered no other group
+    assert result["rooms"]["bedroom"]["group_with"] == []
+
+
+def test_a_permanent_group_joins_whole_or_not_at_all() -> None:
+    """Leave out a permanent group with an online room the leader can't take."""
+    players = [*_bedroom(), _player("bath", can_group_with=["bed1"])]
+    locations = {p.player_id: _at() for p in players}
+
+    assert _build(players, locations)["rooms"]["bath"]["group_with"] == []
+
+
+def test_an_offline_room_does_not_block_its_permanent_group() -> None:
+    """Offer a permanent group on its online rooms when one of them is offline."""
+    players = [*_bedroom(), _player("bath", can_group_with=["bed1"])]
+    players[2].state.available = False
+    locations = {p.player_id: _at() for p in players}
+
+    assert _build(players, locations)["rooms"]["bath"]["group_with"] == ["bedroom"]
+
+
+def test_a_permanent_group_held_elsewhere_is_not_offered() -> None:
+    """Leave out a permanent group whose room another group holds."""
+    players = [*_bedroom(), _player("bath", can_group_with=["bed1", "bed2"])]
+    players[1].state.active_group = "upstairs"
+    locations = {p.player_id: _at() for p in players}
+
+    assert _build(players, locations)["rooms"]["bath"]["group_with"] == []
+
+
+def test_a_permanent_group_playing_on_its_own_is_offered() -> None:
+    """Offer a permanent group in its own session, its playing leader judged later."""
+    players = _bedroom(active_group="bedroom")
+    # core leaves the playing sync leader out of every can_group_with
+    players[1].state.group_members = ["bed1", "bed2"]
+    players[2].state.synced_to = "bed1"
+    players.append(_player("bath", can_group_with=["bed2"]))
+    locations = {p.player_id: _at() for p in players}
+
+    result = _build(players, locations, groups={"bed1": {"bed2"}}, colours={"bed1": "green"})
+
+    assert result["rooms"]["bath"]["group_with"] == ["bedroom"]
+    # its own session is no group made on the fly
+    assert result["groups"] == []
+    assert result["rooms"]["bedroom"]["group_leader"] is None
+
+
+def test_a_permanent_group_in_a_group_shows_as_one_member() -> None:
+    """Show a permanent group's rooms in another leader's group as the group itself."""
+    players = [*_bedroom(), _player("bath", can_group_with=["deck"]), _player("deck")]
+    locations = {p.player_id: _at() for p in players}
+
+    result = _build(
+        players, locations, groups={"bath": {"bed1", "bed2", "deck"}}, colours={"bath": "teal"}
+    )
+
+    assert result["groups"] == [
+        {"leader": "bath", "colour": "teal", "members": ["deck", "bedroom"]}
+    ]
+    assert result["rooms"]["bedroom"]["group_leader"] == "bath"
+    assert "bed1" not in result["rooms"]
+    # still on offer, so it can be taken out again
+    assert result["rooms"]["bath"]["group_with"] == ["deck", "bedroom"]
+
+
+def test_a_group_led_by_a_room_of_a_permanent_group_is_led_by_the_group() -> None:
+    """Name the permanent group as leader when one of its rooms leads others."""
+    players = [*_bedroom(), _player("bath"), _player("deck")]
+    locations = {p.player_id: _at() for p in players}
+
+    # the leader of a group holding the permanent group was taken out: core gave bed1 the lead
+    result = _build(
+        players, locations, groups={"bed1": {"bed2", "bath"}}, colours={"bed1": "purple"}
+    )
+
+    assert result["groups"] == [{"leader": "bedroom", "colour": "purple", "members": ["bath"]}]
+    assert result["rooms"]["bath"]["group_leader"] == "bedroom"
+    assert result["rooms"]["bedroom"]["group_leader"] is None
+
+
+def test_a_dynamic_group_keeps_the_rooms_it_leads_listed() -> None:
+    """Swallow only the rooms a group is set up with, not the ones it leads for now."""
+    players = [
+        _player(
+            "bedroom",
+            "Master Bedroom",
+            player_type=PlayerType.GROUP,
+            group_members=["bed1", "bed2", "bath"],
+        ),
+        _player("bed1", hide_in_ui=True),
+        _player("bed2", hide_in_ui=True),
+        _player("bath"),
+    ]
+    locations = {p.player_id: _at() for p in players}
+
+    result = _build(
+        players,
+        locations,
+        groups={"bed1": {"bed2", "bath"}},
+        colours={"bed1": "orange"},
+        group_rooms={"bedroom": ["bed1", "bed2"]},
+    )
+
+    assert set(result["rooms"]) == {"bath", "bedroom"}
+    assert result["permanent_groups"][0]["members"] == ["bed1", "bed2"]
+    assert result["rooms"]["bath"]["group_leader"] == "bedroom"

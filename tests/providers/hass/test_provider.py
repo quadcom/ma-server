@@ -34,6 +34,7 @@ from music_assistant.providers.hass import (
     CONF_URL,
     PLAYER_LOCATIONS_COMMAND,
     SPEAKER_LIST_COMMAND,
+    SPEAKER_LIST_SET_MEMBERS_COMMAND,
     STATE_FETCH_BATCH_SIZE,
     HassPlayerLocations,
     HassRegistryEntity,
@@ -2216,8 +2217,14 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
     unregister_search = MagicMock()
     unregister_locations = MagicMock()
     unregister_speaker_list = MagicMock()
+    unregister_speaker_list_members = MagicMock()
     mass.register_api_command = MagicMock(
-        side_effect=[unregister_search, unregister_locations, unregister_speaker_list]
+        side_effect=[
+            unregister_search,
+            unregister_locations,
+            unregister_speaker_list,
+            unregister_speaker_list_members,
+        ]
     )
     manifest = MagicMock()
     manifest.domain = "hass"
@@ -2231,6 +2238,7 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
     unregister_search.assert_called_once()
     unregister_locations.assert_called_once()
     unregister_speaker_list.assert_called_once()
+    unregister_speaker_list_members.assert_called_once()
 
 
 async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> None:
@@ -2239,8 +2247,14 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
     unregister_search = MagicMock()
     unregister_locations = MagicMock()
     unregister_speaker_list = MagicMock()
+    unregister_speaker_list_members = MagicMock()
     mass.register_api_command = MagicMock(
-        side_effect=[unregister_search, unregister_locations, unregister_speaker_list]
+        side_effect=[
+            unregister_search,
+            unregister_locations,
+            unregister_speaker_list,
+            unregister_speaker_list_members,
+        ]
     )
     manifest = MagicMock()
     manifest.domain = "hass"
@@ -2276,11 +2290,19 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
     )
     handler = APICommandHandler.parse(SPEAKER_LIST_COMMAND, provider.get_speaker_list)
     assert handler.type_hints["return"] is SpeakerList
+    # joining a permanent group as one room changes groups, like players/cmd/set_members
+    mass.register_api_command.assert_any_call(
+        SPEAKER_LIST_SET_MEMBERS_COMMAND,
+        provider.set_speaker_list_members,
+        required_scope=Scope.PLAYERS_CONTROL,
+    )
+    APICommandHandler.parse(SPEAKER_LIST_SET_MEMBERS_COMMAND, provider.set_speaker_list_members)
 
     await provider.unload()
 
     unregister_locations.assert_called_once_with()
     unregister_speaker_list.assert_called_once_with()
+    unregister_speaker_list_members.assert_called_once_with()
     assert mass.subscribe.return_value.call_count >= 1
 
 
