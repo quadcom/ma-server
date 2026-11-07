@@ -20,7 +20,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, TypedDict, cast
 from urllib.parse import unquote, urlsplit
 
-from aiohttp import ClientResponseError
+from aiohttp import ClientResponseError, web
 from hass_client import HomeAssistantClient
 from hass_client.exceptions import (
     BaseHassClientError,
@@ -43,6 +43,7 @@ from music_assistant_models.enums import (
     StreamType,
 )
 from music_assistant_models.errors import (
+    InvalidDataError,
     MusicAssistantError,
     PlayerCommandFailed,
     ProviderUnavailableError,
@@ -54,7 +55,14 @@ from music_assistant_models.media_items.audio_format import AudioFormat
 from music_assistant_models.player_control import PlayerControl
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant.constants import CONF_GROUP_MEMBERS, CONF_VERIFY_SSL, VERBOSE_LOG_LEVEL
+from music_assistant.constants import (
+    ANNOUNCE_ALERT_FILE,
+    CONF_GROUP_MEMBERS,
+    CONF_OUTPUT_CHANNELS,
+    CONF_PREFERRED_OUTPUT_PROTOCOL,
+    CONF_VERIFY_SSL,
+    VERBOSE_LOG_LEVEL,
+)
 from music_assistant.controllers.cache import use_cache
 from music_assistant.controllers.webserver.helpers.auth_middleware import is_own_client_player
 from music_assistant.helpers.datetime import iso_from_utc_timestamp
@@ -134,6 +142,12 @@ SPEAKER_LIST_SET_MEMBERS_COMMAND = f"{DOMAIN}/speaker_list/set_members"
 # to look, before they join another group
 GROUP_RELEASE_TIMEOUT = 5.0
 GROUP_RELEASE_POLL = 0.2
+STEREO_PAIR_IDENTIFY_COMMAND = f"{DOMAIN}/stereo_pair/identify"
+STEREO_PAIR_SET_COMMAND = f"{DOMAIN}/stereo_pair/set"
+# the sound a speaker plays so the user can tell which one it is, served on the stream server
+IDENTIFY_SOUND_PATH = f"/{DOMAIN}/identify.mp3"
+# the output protocol that builds each speaker's audio itself, so each plays its own side
+STEREO_PAIR_PROTOCOL = "sendspin"
 # clients hear of a changed speaker list through a provider event under this sub scope
 SPEAKER_LIST_EVENT_SCOPE = "speaker_list"
 # window to collect changes in, so a burst of player or registry updates sends one event
@@ -283,6 +297,7 @@ class HomeAssistantProvider(PluginProvider):
     _group_colours: GroupColours | None = None
     _unregister_speaker_list_command: Callable[[], None] | None = None
     _unregister_speaker_list_members_command: Callable[[], None] | None = None
+    _unregister_stereo_pair_commands: list[Callable[[], None]] | None = None
     _unsubscribe_location_registries: list[Callable[[], None]] | None = None
     # bumped (and announced) whenever the speaker list may look different
     _speaker_list_revision: int = 0
@@ -826,6 +841,11 @@ class HomeAssistantProvider(PluginProvider):
         everyone = list(self.mass.players.iter_players())
         visible = self.mass.players.all_players()
         group_colours = self._refresh_group_colours()
+        group_rooms = {
+            player.player_id: self._configured_group_rooms(player.player_id)
+            for player in everyone
+            if player.state.type == PlayerType.GROUP
+        }
         return build_speaker_list(
             visible=visible,
             everyone=everyone,
@@ -837,10 +857,14 @@ class HomeAssistantProvider(PluginProvider):
             own_player_id=next(
                 (player.player_id for player in visible if is_own_client_player(player)), None
             ),
-            group_rooms={
-                player.player_id: self._configured_group_rooms(player.player_id)
-                for player in everyone
-                if player.state.type == PlayerType.GROUP
+            group_rooms=group_rooms,
+            sides={
+                room_id: self._room_side(room_id)
+                for group_player in everyone
+                if group_player.state.type == PlayerType.GROUP
+                for room_id in permanent_group_rooms(
+                    group_player, group_rooms[group_player.player_id]
+                )
             },
         )
 
@@ -904,6 +928,62 @@ class HomeAssistantProvider(PluginProvider):
             player_ids_to_add=list(dict.fromkeys(to_add)) or None,
             player_ids_to_remove=list(dict.fromkeys(to_remove)) or None,
         )
+
+    async def identify_stereo_speaker(self, player_id: str) -> None:
+        """
+        Play a short sound on one speaker, so the user can tell which one it is.
+
+        Used while setting up a stereo pair ("Is this your left speaker?"). Returns once the
+        sound is sent, not when it has played, and may be repeated.
+
+        :param player_id: The speaker to play the sound on.
+        """
+        player = self.mass.players.get_player(player_id)
+        if player is None or not player.state.available:
+            msg = f"Speaker {player_id} is not available"
+            raise PlayerCommandFailed(msg)
+        url = f"{self.mass.streams.base_url}{IDENTIFY_SOUND_PATH}"
+        self.mass.create_task(
+            self.mass.players.play_announcement(player_id, url=url, pre_announce=False)
+        )
+
+    async def set_stereo_pair(self, group_id: str, left_player_id: str | None = None) -> None:
+        """
+        Make a permanent group of two speakers a stereo pair, or turn the pair off.
+
+        The left speaker plays only the left side and the other only the right. Both play
+        over their own Sendspin output, which builds each speaker's audio itself: grouped
+        the speaker's own way (such as Sonos's), both would play one shared stream. The
+        pair stays a permanent group, so it still joins and leads other groups as one room.
+
+        :param group_id: The permanent group of exactly two speakers.
+        :param left_player_id: The speaker on the left, or None to turn the pair off and
+            put both speakers back to stereo.
+        """
+        group_player = self.mass.players.get_player(group_id)
+        if group_player is None or group_player.state.type != PlayerType.GROUP:
+            msg = f"{group_id} is not a permanent group"
+            raise InvalidDataError(msg)
+        rooms = self._group_rooms(group_player)
+        if len(rooms) != 2:
+            msg = "A stereo pair needs a permanent group of exactly two speakers"
+            raise InvalidDataError(msg)
+        if left_player_id is not None and left_player_id not in rooms:
+            msg = f"{left_player_id} is not a speaker of {group_id}"
+            raise InvalidDataError(msg)
+        players = {room_id: self.mass.players.get_player(room_id) for room_id in rooms}
+        if left_player_id is None:
+            for room_id, room in players.items():
+                await self._set_room_side(room_id, room, "stereo", None)
+        else:
+            outputs = {room_id: self._stereo_output(room) for room_id, room in players.items()}
+            if missing := [room_id for room_id, output in outputs.items() if output is None]:
+                msg = f"Speaker {missing[0]} has no Sendspin output to play one side on"
+                raise PlayerCommandFailed(msg)
+            for room_id, room in players.items():
+                side = "left" if room_id == left_player_id else "right"
+                await self._set_room_side(room_id, room, side, outputs[room_id])
+        self._speaker_list_changed()
 
     async def get_states(
         self,
@@ -1445,6 +1525,9 @@ class HomeAssistantProvider(PluginProvider):
         if unregister := self._unregister_speaker_list_members_command:
             self._unregister_speaker_list_members_command = None
             unregister()
+        for unregister_stereo in self._unregister_stereo_pair_commands or ():
+            unregister_stereo()
+        self._unregister_stereo_pair_commands = None
         for unsubscribe_registry in self._unsubscribe_location_registries or ():
             unsubscribe_registry()
         self._unsubscribe_location_registries = None
@@ -1712,6 +1795,23 @@ class HomeAssistantProvider(PluginProvider):
             self.set_speaker_list_members,
             required_scope=Scope.PLAYERS_CONTROL,
         )
+        self._unregister_stereo_pair_commands = [
+            # plays a sound on a speaker, like a player command
+            self.mass.register_api_command(
+                STEREO_PAIR_IDENTIFY_COMMAND,
+                self.identify_stereo_speaker,
+                required_scope=Scope.PLAYERS_CONTROL,
+            ),
+            # writes player settings, like config/players/save
+            self.mass.register_api_command(
+                STEREO_PAIR_SET_COMMAND,
+                self.set_stereo_pair,
+                required_scope=Scope.CONFIG_PLAYERS_WRITE,
+            ),
+            self.mass.streams.register_dynamic_route(
+                IDENTIFY_SOUND_PATH, self._serve_identify_sound
+            ),
+        ]
         # follow the sync groups as they change, so a group that changes leader between
         # two requests for the locations still keeps its colour
         self._group_colours = GroupColours()
@@ -1803,6 +1903,58 @@ class HomeAssistantProvider(PluginProvider):
         return permanent_group_rooms(
             group_player, self._configured_group_rooms(group_player.player_id)
         )
+
+    def _room_side(self, room_id: str) -> str:
+        """Return the side a room is set to play: left, right, stereo or mono."""
+        side = self.mass.config.get_raw_player_config_value(room_id, CONF_OUTPUT_CHANNELS)
+        return str(side or "stereo")
+
+    def _stereo_output(self, room: Player | None) -> str | None:
+        """Return the ID of a room's available Sendspin output, if it has one."""
+        if room is None:
+            return None
+        return next(
+            (
+                output.output_protocol_id
+                for output in room.output_protocols
+                if output.protocol_domain == STEREO_PAIR_PROTOCOL and output.available
+            ),
+            None,
+        )
+
+    async def _set_room_side(
+        self, room_id: str, room: Player | None, side: str, output_id: str | None
+    ) -> None:
+        """
+        Set the side a room plays, and the output it plays over.
+
+        :param room_id: The room (speaker) to set.
+        :param room: The room's player, if it is loaded.
+        :param side: The side to play: left, right or stereo.
+        :param output_id: The output to play a side over, or None to go back to the
+            room's own output.
+        """
+        if output_id is not None:
+            preferred = output_id
+        elif room is not None and any(output.is_native for output in room.output_protocols):
+            preferred = "native"
+        else:
+            preferred = "auto"
+        await self.mass.config.save_player_config(
+            room_id,
+            {CONF_OUTPUT_CHANNELS: side, CONF_PREFERRED_OUTPUT_PROTOCOL: preferred},
+        )
+        # the output builds the room's audio, so it reads the side from its own settings
+        for output in room.output_protocols if room is not None else ():
+            if output.is_native or output.protocol_domain != STEREO_PAIR_PROTOCOL:
+                continue
+            await self.mass.config.save_player_config(
+                output.output_protocol_id, {CONF_OUTPUT_CHANNELS: side}
+            )
+
+    async def _serve_identify_sound(self, request: web.Request) -> web.FileResponse:
+        """Serve the sound a speaker plays to tell the user which one it is."""
+        return web.FileResponse(ANNOUNCE_ALERT_FILE, headers={"Cache-Control": "no-store"})
 
     async def _wait_rooms_released(self, group_id: str, room_ids: list[str]) -> None:
         """

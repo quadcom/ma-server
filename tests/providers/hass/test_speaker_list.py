@@ -52,6 +52,7 @@ def _build(
     groups: dict[str, set[str]] | None = None,
     colours: dict[str, str] | None = None,
     group_rooms: dict[str, list[str]] | None = None,
+    sides: dict[str, str] | None = None,
 ) -> Any:
     return build_speaker_list(
         visible=visible if visible is not None else players,
@@ -62,6 +63,7 @@ def _build(
         colours=colours or {},
         revision=7,
         group_rooms=group_rooms,
+        sides=sides,
     )
 
 
@@ -208,8 +210,15 @@ def test_a_permanent_group_is_one_room_without_its_members() -> None:
     assert _sections(result) == [("floor", "Main", ["kitchen", "bedroom"])]
     assert result["rooms"]["bedroom"]["is_permanent_group"] is True
     assert result["permanent_groups"] == [
-        {"player": "bedroom", "name": "Master Bedroom", "members": ["bed1", "bed2"]}
+        {
+            "player": "bedroom",
+            "name": "Master Bedroom",
+            "members": ["bed1", "bed2"],
+            "is_stereo_pair": False,
+            "stereo_left": None,
+        }
     ]
+    assert result["rooms"]["bedroom"]["is_stereo_pair"] is False
 
 
 def test_groups_made_on_the_fly_grey_their_members() -> None:
@@ -424,3 +433,33 @@ def test_a_dynamic_group_keeps_the_rooms_it_leads_listed() -> None:
     assert set(result["rooms"]) == {"bath", "bedroom"}
     assert result["permanent_groups"][0]["members"] == ["bed1", "bed2"]
     assert result["rooms"]["bath"]["group_leader"] == "bedroom"
+
+
+def test_a_group_of_a_left_and_a_right_room_is_a_stereo_pair() -> None:
+    """Mark a permanent group of a left and a right room as a stereo pair, naming the left."""
+    players = [*_bedroom(), _player("bath", can_group_with=["bed1", "bed2"])]
+    locations = {p.player_id: _at() for p in players}
+
+    result = _build(players, locations, sides={"bed1": "right", "bed2": "left"})
+
+    assert result["rooms"]["bedroom"]["is_stereo_pair"] is True
+    assert result["permanent_groups"][0]["is_stereo_pair"] is True
+    assert result["permanent_groups"][0]["stereo_left"] == "bed2"
+    # still one room on offer to other groups
+    assert result["rooms"]["bath"]["group_with"] == ["bedroom"]
+
+
+def test_rooms_on_the_same_side_are_no_stereo_pair() -> None:
+    """Need one left and one right room, and only two rooms, for a stereo pair."""
+    players = _bedroom()
+    locations = {p.player_id: _at() for p in players}
+
+    for sides in ({"bed1": "left", "bed2": "left"}, {"bed1": "left"}, {}):
+        result = _build(players, locations, sides=sides)
+        assert result["rooms"]["bedroom"]["is_stereo_pair"] is False
+        assert result["permanent_groups"][0]["stereo_left"] is None
+
+    trio = [*players, _player("bed3", hide_in_ui=True)]
+    trio[0].state.static_group_members = ["bed1", "bed2", "bed3"]
+    result = _build(trio, locations, sides={"bed1": "left", "bed2": "right"})
+    assert result["rooms"]["bedroom"]["is_stereo_pair"] is False

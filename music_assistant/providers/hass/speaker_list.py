@@ -43,6 +43,8 @@ class SpeakerListRoom(TypedDict):
     # the leader of the group made on the fly that this room is a member of
     group_leader: str | None
     is_permanent_group: bool
+    # a permanent group of two rooms set to the left and the right side
+    is_stereo_pair: bool
     # the rooms a group editor may offer to group with this room, in name order
     group_with: list[str]
 
@@ -61,6 +63,9 @@ class SpeakerListPermanentGroup(TypedDict):
     player: str
     name: str
     members: list[str]
+    is_stereo_pair: bool
+    # the room playing the left side of a stereo pair, None for any other group
+    stereo_left: str | None
 
 
 class SpeakerList(TypedDict):
@@ -85,6 +90,7 @@ def build_speaker_list(
     revision: int,
     own_player_id: str | None = None,
     group_rooms: Mapping[str, list[str] | None] | None = None,
+    sides: Mapping[str, str] | None = None,
 ) -> SpeakerList:
     """
     Build the speaker list one user sees.
@@ -101,6 +107,9 @@ def build_speaker_list(
     :param group_rooms: The rooms each group player is set up with, keyed by its ID. A
         group that takes in more rooms as it plays (a dynamic sync group) keeps them only
         in its settings, not in its state.
+    :param sides: The side each room is set to play ("left", "right", "stereo" or
+        "mono"), keyed by room ID. A permanent group of two rooms set to left and right is
+        a stereo pair.
     """
     visible_players = {player.player_id: player for player in visible}
     everyone_by_id = {player.player_id: player for player in everyone}
@@ -141,6 +150,11 @@ def build_speaker_list(
     permanent = [
         group_player for group_player in group_players if group_player.player_id in listed_ids
     ]
+    stereo_left = {
+        group_player.player_id: left
+        for group_player in permanent
+        if (left := stereo_pair_left(rooms_of[group_player.player_id], sides or {}))
+    }
 
     def _name_key(player_id: str) -> tuple[str, str]:
         player = visible_players.get(player_id)
@@ -158,6 +172,7 @@ def build_speaker_list(
             "available": player.state.available,
             "group_leader": leader_of.get(player.player_id),
             "is_permanent_group": player.state.type == PlayerType.GROUP,
+            "is_stereo_pair": player.player_id in stereo_left,
             "group_with": sorted(
                 _group_with(player, visible_players, swallowed, groups)
                 | _permanent_groups_to_offer(player, permanent, rooms_of, everyone_by_id, groups),
@@ -183,10 +198,29 @@ def build_speaker_list(
                 "player": player.player_id,
                 "name": _name(player),
                 "members": sorted(rooms_of[player.player_id], key=_name_key),
+                "is_stereo_pair": player.player_id in stereo_left,
+                "stereo_left": stereo_left.get(player.player_id),
             }
             for player in sorted(permanent, key=lambda p: _name_key(p.player_id))
         ],
     }
+
+
+def stereo_pair_left(room_ids: list[str], sides: Mapping[str, str]) -> str | None:
+    """
+    Return the left room of a stereo pair, or None if the rooms are no stereo pair.
+
+    A stereo pair is exactly two rooms, one set to play the left side and one the right.
+
+    :param room_ids: The rooms a permanent group is set up with.
+    :param sides: The side each room is set to play, keyed by room ID.
+    """
+    if len(room_ids) != 2:
+        return None
+    by_side = {sides.get(room_id): room_id for room_id in room_ids}
+    if set(by_side) != {"left", "right"}:
+        return None
+    return by_side["left"]
 
 
 def _name(player: Player) -> str:
