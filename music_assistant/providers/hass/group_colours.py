@@ -17,7 +17,9 @@ if TYPE_CHECKING:
 GROUP_COLOURS: Final = ("orange", "purple", "green", "pink", "yellow", "teal")
 
 
-def groups_from_players(players: Iterable[Player]) -> dict[str, set[str]]:
+def groups_from_players(
+    players: Iterable[Player], dynamic_groups: AbstractSet[str] = frozenset()
+) -> dict[str, set[str]]:
     """
     Return the groups made on the fly among the given players, as leader ID to member IDs.
 
@@ -25,10 +27,13 @@ def groups_from_players(players: Iterable[Player]) -> dict[str, set[str]]:
     players are synced to it. The leader itself is never among its members. A player
     with no members leads no group.
 
-    Group players (a permanent sync group, for example) are left out, and so are the
-    players that belong to one: such a group has a name of its own and needs no colour.
+    Group players (a permanent sync group, for example) lead no group here: such a group
+    has a name of its own. A dynamic group is the exception: while it plays, it leads the
+    group of the players playing with it, so they take a colour like any group made on
+    the fly (and the room leading its session leads no group of its own).
 
     :param players: The players to look at, as clients see them.
+    :param dynamic_groups: The IDs of the dynamic group players (Dynamic members on).
     """
     player_list = list(players)
     group_player_ids = {p.player_id for p in player_list if p.type == PlayerType.GROUP}
@@ -42,7 +47,24 @@ def groups_from_players(players: Iterable[Player]) -> dict[str, set[str]]:
         leader_id = state.synced_to
         if leader_id and leader_id != player.player_id and leader_id not in group_player_ids:
             groups.setdefault(leader_id, set()).add(player.player_id)
-    return groups
+    by_id = {p.player_id: p for p in player_list}
+    for group_id in sorted(dynamic_groups & group_player_ids):
+        session_members = {
+            member_id
+            for member_id in by_id[group_id].state.group_members
+            if member_id != group_id
+            and member_id in by_id
+            and by_id[member_id].state.active_group == group_id
+        }
+        if not session_members:
+            # not playing: its members are only its preset
+            continue
+        for member_id in session_members:
+            groups.pop(member_id, None)
+        for other_members in groups.values():
+            other_members.difference_update(session_members)
+        groups[group_id] = session_members
+    return {leader_id: members for leader_id, members in groups.items() if members}
 
 
 class GroupColours:

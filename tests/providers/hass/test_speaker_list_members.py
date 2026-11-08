@@ -382,15 +382,15 @@ def _for_create(*, groups: dict[str, list[str]] | None = None, **bed2: Any) -> A
     return provider
 
 
-async def test_create_makes_a_dynamic_group_of_the_two() -> None:
-    """Make a group of the two speakers that can still lead others, and say its ID."""
+async def test_create_makes_a_fixed_group_of_the_two() -> None:
+    """Make a fixed group of the two speakers (it still leads others), and say its ID."""
     provider = _for_create()
 
     result = await provider.create_stereo_pair("Master Bedroom", ["bed1", "bed2"])
 
     assert result == {"group_id": "syncgroup_new"}
     provider.mass.players.create_group_player.assert_awaited_once_with(
-        "sync_group", "Master Bedroom", ["bed1", "bed2"], True
+        "sync_group", "Master Bedroom", ["bed1", "bed2"], False
     )
     provider.mass.config.save_player_config.assert_not_awaited()
     provider._speaker_list_changed.assert_called_once_with()

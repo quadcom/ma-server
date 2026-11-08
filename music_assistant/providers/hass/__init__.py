@@ -58,6 +58,7 @@ from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import (
     ANNOUNCE_ALERT_FILE,
+    CONF_DYNAMIC_GROUP_MEMBERS,
     CONF_GROUP_MEMBERS,
     CONF_OUTPUT_CHANNELS,
     CONF_PREFERRED_OUTPUT_PROTOCOL,
@@ -918,6 +919,8 @@ class HomeAssistantProvider(PluginProvider):
         colour, and their members name their leader. A permanent group counts as one room
         there too: it is offered to other groups, shows as one member when its rooms join
         one, and as the leader when one of its rooms leads (see set_speaker_list_members).
+        A dynamic group (Dynamic members on) is a named room too, but its rooms stay
+        listed; while it plays it leads the coloured group of the rooms playing with it.
 
         Clients are told of a change by a provider event under the sub scope
         "speaker_list", carrying the new revision, and then ask again.
@@ -926,6 +929,7 @@ class HomeAssistantProvider(PluginProvider):
         everyone = list(self.mass.players.iter_players())
         visible = self.mass.players.all_players()
         group_colours = self._refresh_group_colours()
+        dynamic_groups = self._dynamic_group_ids()
         group_rooms = {
             player.player_id: self._configured_group_rooms(player.player_id)
             for player in everyone
@@ -936,13 +940,14 @@ class HomeAssistantProvider(PluginProvider):
             everyone=everyone,
             locations=locations["players"],
             grouping=locations["grouping"],
-            groups=groups_from_players(everyone),
+            groups=groups_from_players(everyone, dynamic_groups),
             colours=group_colours.colours,
             revision=self._speaker_list_revision,
             own_player_id=next(
                 (player.player_id for player in visible if is_own_client_player(player)), None
             ),
             group_rooms=group_rooms,
+            dynamic_groups=dynamic_groups,
             sides={
                 room_id: self._room_side(room_id)
                 for group_player in everyone
@@ -1082,8 +1087,9 @@ class HomeAssistantProvider(PluginProvider):
         Everything is checked first, so nothing is made when the two can't be a pair: they
         must be two different, available speakers that can play together, neither in a
         permanent group already, and both with a Sendspin output (which a pair plays over).
-        The group can take in more rooms as it plays, so the pair can still lead other
-        rooms. With a left speaker it becomes a stereo pair at once (as set_stereo_pair);
+        The group is a fixed (permanent) one: it always holds its two speakers and pulls
+        one that drops out back in, and it still takes in other rooms when it leads them.
+        With a left speaker it becomes a stereo pair at once (as set_stereo_pair);
         without one, the sides are set afterwards.
 
         :param name: The name of the new pair.
@@ -1099,7 +1105,12 @@ class HomeAssistantProvider(PluginProvider):
             msg = "Music Assistant can't make permanent groups right now"
             raise PlayerCommandFailed(msg)
         group_player = await self.mass.players.create_group_player(
-            provider.instance_id, name, list(rooms), True
+            # fixed (not dynamic): it always holds its two speakers, pulls one that drops
+            # out back in, and still takes in other rooms when it leads them
+            provider.instance_id,
+            name,
+            list(rooms),
+            False,
         )
         if set(self._group_rooms(group_player)) != set(rooms):
             # the group player was made without one of them: leave nothing half made
@@ -2145,7 +2156,9 @@ class HomeAssistantProvider(PluginProvider):
         """Bring the group colours in line with the sync groups as they are now."""
         if self._group_colours is None:
             self._group_colours = GroupColours()
-        self._group_colours.update(groups_from_players(self.mass.players.iter_players()))
+        self._group_colours.update(
+            groups_from_players(self.mass.players.iter_players(), self._dynamic_group_ids())
+        )
         return self._group_colours
 
     def _player_grouping(self) -> Literal["floor", "area", "label", "none"]:
@@ -2168,6 +2181,17 @@ class HomeAssistantProvider(PluginProvider):
         """Return the rooms a permanent group stands in for, as the speaker list has them."""
         return permanent_group_rooms(
             group_player, self._configured_group_rooms(group_player.player_id)
+        )
+
+    def _dynamic_group_ids(self) -> frozenset[str]:
+        """Return the IDs of the dynamic group players (Dynamic members on)."""
+        return frozenset(
+            player.player_id
+            for player in self.mass.players.iter_players()
+            if player.type == PlayerType.GROUP
+            and self.mass.config.get_raw_player_config_value(
+                player.player_id, CONF_DYNAMIC_GROUP_MEMBERS
+            )
         )
 
     def _pair_rooms(self, player_ids: list[str]) -> dict[str, Player]:

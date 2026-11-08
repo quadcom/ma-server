@@ -53,6 +53,7 @@ def _build(
     colours: dict[str, str] | None = None,
     group_rooms: dict[str, list[str]] | None = None,
     sides: dict[str, str] | None = None,
+    dynamic_groups: set[str] | None = None,
 ) -> Any:
     return build_speaker_list(
         visible=visible if visible is not None else players,
@@ -64,6 +65,7 @@ def _build(
         revision=7,
         group_rooms=group_rooms,
         sides=sides,
+        dynamic_groups=frozenset(dynamic_groups or ()),
     )
 
 
@@ -327,7 +329,7 @@ def test_a_permanent_group_is_offered_as_one_room() -> None:
     result = _build(players, locations)
 
     assert result["rooms"]["bath"]["group_with"] == ["deck", "bedroom"]
-    # a group player leads with its own fixed rooms, so it is offered no other group
+    # its rooms are never offered back to it
     assert result["rooms"]["bedroom"]["group_with"] == []
 
 
@@ -463,3 +465,90 @@ def test_rooms_on_the_same_side_are_no_stereo_pair() -> None:
     trio[0].state.static_group_members = ["bed1", "bed2", "bed3"]
     result = _build(trio, locations, sides={"bed1": "left", "bed2": "right"})
     assert result["rooms"]["bedroom"]["is_stereo_pair"] is False
+
+
+def test_group_kind_of_each_room() -> None:
+    """Name the kind of each group player, and nothing for a speaker of its own."""
+    players = [
+        *_bedroom(),
+        _player("party", "Party", player_type=PlayerType.GROUP, group_members=["bath"]),
+        _player("bath"),
+    ]
+    locations = {p.player_id: _at() for p in players}
+
+    result = _build(players, locations, dynamic_groups={"party"})
+    kinds = {room_id: room["group_kind"] for room_id, room in result["rooms"].items()}
+    assert kinds == {"bedroom": "permanent", "party": "dynamic", "bath": None}
+
+    paired = _build(players, locations, sides={"bed1": "left", "bed2": "right"})
+    assert paired["rooms"]["bedroom"]["group_kind"] == "stereo_pair"
+    assert paired["rooms"]["bedroom"]["is_permanent_group"] is True
+
+
+def test_a_dynamic_group_is_a_named_room_that_keeps_its_rooms_listed() -> None:
+    """List a dynamic group as a room of its own, beside its rooms, as no permanent group."""
+    players = [
+        _player(
+            "party",
+            "Party",
+            player_type=PlayerType.GROUP,
+            group_members=["deck", "pool"],
+            can_group_with=["deck", "pool", "kitchen"],
+        ),
+        _player("deck"),
+        _player("pool"),
+        _player("kitchen", can_group_with=["deck", "pool", "party"]),
+    ]
+    locations = {p.player_id: _at() for p in players}
+
+    result = _build(players, locations, dynamic_groups={"party"})
+
+    assert set(result["rooms"]) == {"party", "deck", "pool", "kitchen"}
+    assert result["rooms"]["party"]["is_permanent_group"] is False
+    assert result["permanent_groups"] == []
+    # it leads others, but is never offered to join another room's group
+    assert result["rooms"]["party"]["group_with"] == ["deck", "kitchen", "pool"]
+    assert result["rooms"]["kitchen"]["group_with"] == ["deck", "pool"]
+
+
+def test_a_playing_dynamic_group_leads_its_coloured_group() -> None:
+    """Show the rooms playing with a dynamic group in its group, in its colour."""
+    players = [
+        _player("party", "Party", player_type=PlayerType.GROUP, group_members=["deck", "pool"]),
+        _player("deck", active_group="party"),
+        _player("pool", active_group="party"),
+    ]
+    locations = {p.player_id: _at() for p in players}
+
+    result = _build(
+        players,
+        locations,
+        groups={"party": {"deck", "pool"}},
+        colours={"party": "green"},
+        dynamic_groups={"party"},
+    )
+
+    assert result["groups"] == [{"leader": "party", "colour": "green", "members": ["deck", "pool"]}]
+    assert result["rooms"]["deck"]["group_leader"] == "party"
+
+
+def test_a_permanent_group_can_lead_another_permanent_group() -> None:
+    """Offer a permanent group the rooms and permanent groups it can take in as extras."""
+    office = [
+        _player(
+            "office",
+            "Office",
+            player_type=PlayerType.GROUP,
+            static_group_members=["desk1", "desk2"],
+            group_members=["desk1", "desk2"],
+        ),
+        _player("desk1", hide_in_ui=True),
+        _player("desk2", hide_in_ui=True),
+    ]
+    players = [*_bedroom(), *office, _player("deck")]
+    players[0].state.can_group_with = ["bed1", "bed2", "desk1", "desk2", "deck"]
+    locations = {p.player_id: _at() for p in players}
+
+    result = _build(players, locations)
+
+    assert result["rooms"]["bedroom"]["group_with"] == ["deck", "office"]

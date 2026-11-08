@@ -61,6 +61,35 @@ def test_permanent_group_players_get_no_colour() -> None:
     assert groups_from_players(players) == {"kitchen": {"dining"}}
 
 
+def test_a_playing_dynamic_group_leads_the_rooms_playing_with_it() -> None:
+    """Make a playing dynamic group the leader of its rooms, not the room leading its session."""
+    players = [
+        _player("party", group_members=["deck", "pool"], player_type=PlayerType.GROUP),
+        _player("deck", group_members=["deck", "pool"], active_group="party"),
+        _player("pool", synced_to="deck", active_group="party"),
+        _player("kitchen", group_members=["kitchen", "dining"]),
+        _player("dining", synced_to="kitchen"),
+    ]
+
+    assert groups_from_players(players, {"party"}) == {
+        "party": {"deck", "pool"},
+        "kitchen": {"dining"},
+    }
+    # without knowing it is dynamic, it stays a group player with no colour of its own
+    assert groups_from_players(players) == {"deck": {"pool"}, "kitchen": {"dining"}}
+
+
+def test_an_idle_dynamic_group_leads_nothing() -> None:
+    """Leave a dynamic group that is not playing out: its members are only its preset."""
+    players = [
+        _player("party", group_members=["deck", "pool"], player_type=PlayerType.GROUP),
+        _player("deck"),
+        _player("pool"),
+    ]
+
+    assert groups_from_players(players, {"party"}) == {}
+
+
 def test_new_groups_take_the_colours_in_order() -> None:
     """Give the first group orange and the next ones the following colours."""
     assert _colours({"a": {"a1"}, "b": {"b1"}, "c": {"c1"}}) == {

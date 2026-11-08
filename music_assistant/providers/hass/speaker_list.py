@@ -8,6 +8,7 @@ from music_assistant_models.enums import PlayerType
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
+    from collections.abc import Set as AbstractSet
 
     from music_assistant.models.player import Player
 
@@ -19,6 +20,8 @@ _NEVER_LISTED = (PlayerType.SOURCE, PlayerType.PROTOCOL)
 _NEVER_GROUPED = (PlayerType.SOURCE, PlayerType.PROTOCOL, PlayerType.UNKNOWN, PlayerType.GROUP)
 
 type SectionKind = Literal["floor", "area", "label", "other", "all"]
+# what kind of group player a room is, None for a speaker of its own
+type GroupKind = Literal["permanent", "dynamic", "stereo_pair"]
 
 
 class SpeakerListSection(TypedDict):
@@ -42,7 +45,12 @@ class SpeakerListRoom(TypedDict):
     available: bool
     # the leader of the group made on the fly that this room is a member of
     group_leader: str | None
+    # a permanent group: it stands in for its rooms, which leave the list
     is_permanent_group: bool
+    # permanent (incl. a stereo pair) or dynamic group player, None for any other room. A
+    # dynamic group (Dynamic members on) is a named target: its rooms stay in the list, and
+    # while it plays it leads the group of the rooms playing with it
+    group_kind: GroupKind | None
     # a permanent group of two rooms set to the left and the right side
     is_stereo_pair: bool
     # the rooms a group editor may offer to group with this room, in name order
@@ -79,7 +87,7 @@ class SpeakerList(TypedDict):
     permanent_groups: list[SpeakerListPermanentGroup]
 
 
-def build_speaker_list(
+def build_speaker_list(  # noqa: PLR0913
     *,
     visible: Iterable[Player],
     everyone: Iterable[Player],
@@ -91,6 +99,7 @@ def build_speaker_list(
     own_player_id: str | None = None,
     group_rooms: Mapping[str, list[str] | None] | None = None,
     sides: Mapping[str, str] | None = None,
+    dynamic_groups: AbstractSet[str] = frozenset(),
 ) -> SpeakerList:
     """
     Build the speaker list one user sees.
@@ -110,11 +119,17 @@ def build_speaker_list(
     :param sides: The side each room is set to play ("left", "right", "stereo" or
         "mono"), keyed by room ID. A permanent group of two rooms set to left and right is
         a stereo pair.
+    :param dynamic_groups: The IDs of the dynamic group players (Dynamic members on).
+        They are rooms of their own, and their rooms stay listed; the groups made on the
+        fly (see groups_from_players) already have a playing one as a leader.
     """
     visible_players = {player.player_id: player for player in visible}
     everyone_by_id = {player.player_id: player for player in everyone}
+    # only a permanent group stands in for its rooms; a dynamic one leaves them listed
     group_players = [
-        player for player in everyone_by_id.values() if player.state.type == PlayerType.GROUP
+        player
+        for player in everyone_by_id.values()
+        if player.state.type == PlayerType.GROUP and player.player_id not in dynamic_groups
     ]
     rooms_of = {
         group_player.player_id: permanent_group_rooms(
@@ -150,6 +165,7 @@ def build_speaker_list(
     permanent = [
         group_player for group_player in group_players if group_player.player_id in listed_ids
     ]
+    permanent_ids = {group_player.player_id for group_player in permanent}
     stereo_left = {
         group_player.player_id: left
         for group_player in permanent
@@ -171,7 +187,8 @@ def build_speaker_list(
             "labels": list(location["labels"]) if location else [],
             "available": player.state.available,
             "group_leader": leader_of.get(player.player_id),
-            "is_permanent_group": player.state.type == PlayerType.GROUP,
+            "is_permanent_group": player.player_id in permanent_ids,
+            "group_kind": _group_kind(player, permanent_ids, stereo_left),
             "is_stereo_pair": player.player_id in stereo_left,
             "group_with": sorted(
                 _group_with(player, visible_players, swallowed, groups)
@@ -225,6 +242,19 @@ def stereo_pair_left(room_ids: list[str], sides: Mapping[str, str]) -> str | Non
 
 def _name(player: Player) -> str:
     return player.state.name or player.player_id
+
+
+def _group_kind(
+    player: Player, permanent_ids: AbstractSet[str], stereo_left: Mapping[str, str]
+) -> GroupKind | None:
+    """Return what kind of group player a listed room is, None for a speaker of its own."""
+    if player.player_id in stereo_left:
+        return "stereo_pair"
+    if player.player_id in permanent_ids:
+        return "permanent"
+    if player.state.type == PlayerType.GROUP:
+        return "dynamic"
+    return None
 
 
 def _group_with(
@@ -318,11 +348,9 @@ def _permanent_groups_to_offer(
     A permanent group joins as its rooms, so it is offered when every one of its rooms that
     is online may join the leader (a room that is offline doesn't block it). A permanent
     group playing on its own is offered too, as joining ends that session, and so is one
-    already in the leader's group, so it can be taken out again. A group player never
-    leads another this way: its own list of rooms is fixed.
+    already in the leader's group, so it can be taken out again. A group player leads
+    others too: a dynamic one takes in any room, a permanent one rooms beyond its own.
     """
-    if leader.state.type == PlayerType.GROUP:
-        return set()
     can_group_with = set(leader.state.can_group_with)
     in_group = set(groups.get(leader.player_id, ()))
     offered: set[str] = set()
@@ -334,7 +362,8 @@ def _permanent_groups_to_offer(
             continue
         member_ids = rooms_of[group_id]
         if (
-            leader.player_id in member_ids
+            group_id == leader.player_id
+            or leader.player_id in member_ids
             or not state.enabled
             or not state.available
             or state.hide_in_ui
