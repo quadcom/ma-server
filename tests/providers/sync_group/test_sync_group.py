@@ -4091,3 +4091,142 @@ class TestNextTrackHandoverLocksTheLeader:
         await sgp.enqueue_next_media(MagicMock())
 
         mass.players._handle_enqueue_next_media.assert_not_awaited()
+
+
+def _fixed_group(
+    mass: MagicMock, preset: list[str] | None = None
+) -> tuple[SyncGroupPlayer, dict[str, MagicMock]]:
+    """Return a playing fixed group (Dynamic members off) of a leader and a display."""
+    preset = preset if preset is not None else ["leader", "display"]
+    sgp = _make_sync_group(mass)
+    settings: dict[str, Any] = {
+        "dynamic_members": False,
+        "members_filter": [],
+        "group_members": list(preset),
+    }
+    sgp.config.get_value = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda key, default=None: settings.get(key, default)
+    )
+    sgp._cache.clear()
+    players = {
+        player_id: _make_mock_player(player_id, provider_domain="sendspin")
+        for player_id in ("leader", "display", "extra")
+    }
+    for player in players.values():
+        player.state.active_group = None
+    players["leader"].state.group_members = ["leader", "display"]
+    players["leader"].state.can_group_with = {"display", "extra"}
+    mass.players.get_player = _player_lookup(players)
+    return sgp, players
+
+
+class TestFixedGroupTakesExtraMembers:
+    """A fixed group keeps its own members but can take in (and lead) extra players."""
+
+    @pytest.mark.asyncio
+    async def test_fixed_group_holds_its_members_and_takes_extras(self) -> None:
+        """Its configured members are static, and it supports adding members."""
+        mass = _make_mock_mass()
+        sgp, _players = _fixed_group(mass)
+
+        await sgp.on_config_updated()
+
+        assert sgp._attr_static_group_members == ["leader", "display"]
+        assert sgp._attr_group_members == ["leader", "display"]
+        assert PlayerFeature.SET_MEMBERS in sgp._attr_supported_features
+        assert PlayerFeature.SET_MEMBERS in sgp.supported_features
+
+    @pytest.mark.asyncio
+    async def test_fixed_group_offers_what_its_members_can_group_with(self) -> None:
+        """It can lead other players, not only its own members."""
+        mass = _make_mock_mass()
+        sgp, _players = _fixed_group(mass)
+        await sgp.on_config_updated()
+
+        assert "extra" in sgp.can_group_with
+
+    @pytest.mark.asyncio
+    async def test_extra_player_joins_a_playing_fixed_group(self) -> None:
+        """An extra player is added to the live leader and tracked for the session."""
+        mass = _make_mock_mass()
+        sgp, players = _fixed_group(mass)
+        await sgp.on_config_updated()
+        sgp.sync_leader = players["leader"]
+
+        await sgp.set_members(player_ids_to_add=["extra"])
+
+        assert sgp._attr_group_members == ["leader", "display", "extra"]
+        mass.players._handle_set_members.assert_awaited_once_with(
+            players["leader"], player_ids_to_add=["extra"], player_ids_to_remove=[]
+        )
+
+    @pytest.mark.asyncio
+    async def test_own_member_can_not_be_removed(self) -> None:
+        """Removing a configured member is refused: it only changes in the settings."""
+        mass = _make_mock_mass()
+        sgp, players = _fixed_group(mass)
+        await sgp.on_config_updated()
+        sgp.sync_leader = players["leader"]
+
+        with pytest.raises(PlayerCommandFailed):
+            await sgp.set_members(player_ids_to_remove=["display"])
+
+        assert sgp._attr_group_members == ["leader", "display"]
+
+    @pytest.mark.asyncio
+    async def test_extra_player_can_leave(self) -> None:
+        """An extra player is let go again on request."""
+        mass = _make_mock_mass()
+        sgp, players = _fixed_group(mass)
+        await sgp.on_config_updated()
+        sgp.sync_leader = players["leader"]
+        sgp._attr_group_members = ["leader", "display", "extra"]
+
+        await sgp.set_members(player_ids_to_remove=["extra"])
+
+        assert sgp._attr_group_members == ["leader", "display"]
+        mass.players._handle_set_members.assert_awaited_once_with(
+            players["leader"], player_ids_to_add=[], player_ids_to_remove=["extra"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_lets_the_extras_go(self) -> None:
+        """When the session ends, the group goes back to its own members."""
+        mass = _make_mock_mass()
+        sgp, players = _fixed_group(mass)
+        await sgp.on_config_updated()
+        sgp.sync_leader = players["leader"]
+        sgp._attr_group_members = ["leader", "display", "extra"]
+
+        with patch.object(sgp, "update_state"):
+            await sgp.stop()
+
+        assert sgp._attr_group_members == ["leader", "display"]
+
+    @pytest.mark.asyncio
+    async def test_dynamic_group_keeps_its_session_members_after_stop(self) -> None:
+        """A dynamic group is left as it was: it has no own members to go back to."""
+        mass = _make_mock_mass()
+        sgp = _make_sync_group(mass)
+        players = {
+            player_id: _make_mock_player(player_id, provider_domain="sendspin")
+            for player_id in ("leader", "extra")
+        }
+        mass.players.get_player = _player_lookup(players)
+        sgp.sync_leader = players["leader"]
+        sgp._attr_group_members = ["leader", "extra"]
+
+        with patch.object(sgp, "update_state"):
+            await sgp.stop()
+
+        assert sgp._attr_group_members == ["leader", "extra"]
+
+    def test_an_extra_player_that_left_is_not_pulled_back(self) -> None:
+        """Only the group's own members are re-added, not an extra that dropped out."""
+        mass = _make_mock_mass()
+        sgp, players = _fixed_group(mass)
+        sgp._attr_static_group_members = ["leader", "display"]
+        sgp._attr_group_members = ["leader", "display", "extra"]
+        sgp.sync_leader = players["leader"]
+
+        assert sgp._missing_members(players["leader"]) == []

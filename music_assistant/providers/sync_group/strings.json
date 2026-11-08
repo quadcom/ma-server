@@ -20,7 +20,7 @@
     "description": "Create (permanent) sync groups to group speakers of compatible protocols/ecosystems to play audio in sync."
   },
   "errors": {
-    "not_dynamic": "Group {0} does not allow dynamically adding or removing members.",
+    "static_member": "{0} is a fixed member of group {1}; change the group's members in its settings.",
     "remove_self": "Cannot remove {0} from itself as a member."
   }
 }
