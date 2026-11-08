@@ -28,6 +28,8 @@ def _player(player_id: str, player_type: PlayerType = PlayerType.PLAYER, **state
         "static_group_members": [],
         "volume_level": None,
         "playback_state": PlaybackState.IDLE,
+        "can_group_with": [],
+        "name": player_id,
     }
     outputs = state.pop("outputs", [])
     fields.update(state)
@@ -67,7 +69,7 @@ def _provider(
     config = MagicMock()
     config.save_player_config = AsyncMock()
     settings: dict[str, dict[str, Any]] = {
-        CONF_GROUP_MEMBERS: configured or {},
+        CONF_GROUP_MEMBERS: configured if configured is not None else {},
         CONF_OUTPUT_CHANNELS: sides or {},
     }
     config.get_raw_player_config_value = MagicMock(
@@ -351,3 +353,105 @@ async def test_a_group_that_is_no_stereo_pair_keeps_its_volumes() -> None:
     provider._match_starting_stereo_pairs()
 
     provider.mass.create_task.assert_not_called()
+
+
+def _for_create(*, groups: dict[str, list[str]] | None = None, **bed2: Any) -> Any:
+    bed1 = _sonos("bed1")
+    bed1.state.can_group_with = ["bed2"]
+    bed1.state.name = "Master Bedroom 1"
+    second = _sonos("bed2", sendspin=bed2.pop("sendspin", True))
+    second.state.name = "Master Bedroom 2"
+    for key, value in bed2.items():
+        setattr(second.state, key, value)
+    created = _player("syncgroup_new", PlayerType.GROUP)
+    players = [bed1, second, created]
+    for group_id in groups or {}:
+        players.append(_player(group_id, PlayerType.GROUP))
+    configured = dict(groups or {})
+    provider = _provider(players, configured)
+
+    async def _create(_provider_id: str, _name: str, members: list[str], _dynamic: bool) -> Any:
+        configured["syncgroup_new"] = members
+        return created
+
+    provider.mass.players.create_group_player = AsyncMock(side_effect=_create)
+    provider.mass.players.remove_group_player = AsyncMock()
+    provider.mass.get_provider = MagicMock(return_value=SimpleNamespace(instance_id="sync_group"))
+    return provider
+
+
+async def test_create_makes_a_dynamic_group_of_the_two() -> None:
+    """Make a group of the two speakers that can still lead others, and say its ID."""
+    provider = _for_create()
+
+    result = await provider.create_stereo_pair("Master Bedroom", ["bed1", "bed2"])
+
+    assert result == {"group_id": "syncgroup_new"}
+    provider.mass.players.create_group_player.assert_awaited_once_with(
+        "sync_group", "Master Bedroom", ["bed1", "bed2"], True
+    )
+    provider.mass.config.save_player_config.assert_not_awaited()
+    provider._speaker_list_changed.assert_called_once_with()
+
+
+async def test_create_with_a_left_speaker_pairs_at_once() -> None:
+    """Set the sides in the same call when the left speaker is given."""
+    provider = _for_create()
+
+    await provider.create_stereo_pair("Master Bedroom", ["bed1", "bed2"], "bed2")
+
+    saved = {c.args[0]: c.args[1] for c in provider.mass.config.save_player_config.await_args_list}
+    assert saved["bed2"][CONF_OUTPUT_CHANNELS] == "left"
+    assert saved["bed1"][CONF_OUTPUT_CHANNELS] == "right"
+
+
+@pytest.mark.parametrize(
+    ("player_ids", "left", "kwargs", "message"),
+    [
+        (["bed1"], None, {}, "two different speakers"),
+        (["bed1", "bed1"], None, {}, "two different speakers"),
+        (["bed1", "nowhere"], None, {}, "not an available speaker"),
+        (["bed1", "bed2"], None, {"available": False}, "not an available speaker"),
+        (["bed2", "bed1"], None, {}, "can't play together"),
+        (["bed1", "bed2"], None, {"sendspin": False}, "no Sendspin output"),
+        (["bed1", "bed2"], "kitchen", {}, "must be one of the two"),
+    ],
+)
+async def test_create_refuses_what_cant_be_a_pair(
+    player_ids: list[str], left: str | None, kwargs: dict[str, Any], message: str
+) -> None:
+    """Refuse, making nothing, when the two can't be a stereo pair."""
+    provider = _for_create(**kwargs)
+
+    with pytest.raises(InvalidDataError, match=message):
+        await provider.create_stereo_pair("Pair", player_ids, left)
+
+    provider.mass.players.create_group_player.assert_not_awaited()
+
+
+async def test_create_refuses_a_speaker_already_in_a_permanent_group() -> None:
+    """Refuse a speaker that a permanent group already holds."""
+    provider = _for_create(groups={"upstairs": ["bed2", "kitchen"]})
+
+    with pytest.raises(InvalidDataError, match="already in a permanent group"):
+        await provider.create_stereo_pair("Pair", ["bed1", "bed2"])
+
+    provider.mass.players.create_group_player.assert_not_awaited()
+
+
+async def test_create_leaves_nothing_when_a_speaker_is_left_out() -> None:
+    """Remove the new group again when it was made without one of the two."""
+    provider = _for_create()
+
+    async def _create(*_args: Any) -> Any:
+        provider.mass.config.get_raw_player_config_value.side_effect = (
+            lambda _player_id, key, default=None: ["bed1"] if key == CONF_GROUP_MEMBERS else default
+        )
+        return _player("syncgroup_new", PlayerType.GROUP)
+
+    provider.mass.players.create_group_player.side_effect = _create
+
+    with pytest.raises(PlayerCommandFailed):
+        await provider.create_stereo_pair("Pair", ["bed1", "bed2"])
+
+    provider.mass.players.remove_group_player.assert_awaited_once_with("syncgroup_new")

@@ -150,6 +150,9 @@ GROUP_RELEASE_TIMEOUT = 5.0
 GROUP_RELEASE_POLL = 0.2
 STEREO_PAIR_IDENTIFY_COMMAND = f"{DOMAIN}/stereo_pair/identify"
 STEREO_PAIR_SET_COMMAND = f"{DOMAIN}/stereo_pair/set"
+STEREO_PAIR_CREATE_COMMAND = f"{DOMAIN}/stereo_pair/create"
+# the provider that keeps permanent groups (sync groups), which a new stereo pair is made in
+SYNC_GROUP_DOMAIN = "sync_group"
 # the sound a speaker plays so the user can tell which one it is, served on the stream server
 IDENTIFY_SOUND_PATH = f"/{DOMAIN}/identify.mp3"
 # the output protocol that builds each speaker's audio itself, so each plays its own side
@@ -273,6 +276,12 @@ def _grouping_config_entry() -> ConfigEntry:
         # applied in place by update_config, without reconnecting to Home Assistant
         requires_reload=False,
     )
+
+
+class StereoPairCreated(TypedDict):
+    """The stereo pair hass/stereo_pair/create made."""
+
+    group_id: str
 
 
 class HomeAssistantProvider(PluginProvider):
@@ -995,6 +1004,45 @@ class HomeAssistantProvider(PluginProvider):
                 await self._set_room_side(room_id, room, side, outputs[room_id])
             await self._match_pair_volume(players)
         self._speaker_list_changed()
+
+    async def create_stereo_pair(
+        self, name: str, player_ids: list[str], left_player_id: str | None = None
+    ) -> StereoPairCreated:
+        """
+        Make a new permanent group of two speakers, to become a stereo pair.
+
+        Everything is checked first, so nothing is made when the two can't be a pair: they
+        must be two different, available speakers that can play together, neither in a
+        permanent group already, and both with a Sendspin output (which a pair plays over).
+        The group can take in more rooms as it plays, so the pair can still lead other
+        rooms. With a left speaker it becomes a stereo pair at once (as set_stereo_pair);
+        without one, the sides are set afterwards.
+
+        :param name: The name of the new pair.
+        :param player_ids: The two speakers.
+        :param left_player_id: The speaker on the left, if already known.
+        """
+        rooms = self._pair_rooms(player_ids)
+        if left_player_id is not None and left_player_id not in player_ids:
+            msg = "The left speaker must be one of the two speakers"
+            raise InvalidDataError(msg)
+        provider = self.mass.get_provider(SYNC_GROUP_DOMAIN)
+        if provider is None:
+            msg = "Music Assistant can't make permanent groups right now"
+            raise PlayerCommandFailed(msg)
+        group_player = await self.mass.players.create_group_player(
+            provider.instance_id, name, list(rooms), True
+        )
+        if set(self._group_rooms(group_player)) != set(rooms):
+            # the group player was made without one of them: leave nothing half made
+            await self.mass.players.remove_group_player(group_player.player_id)
+            msg = "The two speakers could not be put in one group"
+            raise PlayerCommandFailed(msg)
+        if left_player_id is not None:
+            await self.set_stereo_pair(group_player.player_id, left_player_id)
+        else:
+            self._speaker_list_changed()
+        return {"group_id": group_player.player_id}
 
     async def get_states(
         self,
@@ -1819,6 +1867,12 @@ class HomeAssistantProvider(PluginProvider):
                 self.set_stereo_pair,
                 required_scope=Scope.CONFIG_PLAYERS_WRITE,
             ),
+            # makes a permanent group, like players/create_group_player
+            self.mass.register_api_command(
+                STEREO_PAIR_CREATE_COMMAND,
+                self.create_stereo_pair,
+                required_scope=Scope.CONFIG_PLAYERS_WRITE,
+            ),
             self.mass.streams.register_dynamic_route(
                 IDENTIFY_SOUND_PATH, self._serve_identify_sound
             ),
@@ -1915,6 +1969,42 @@ class HomeAssistantProvider(PluginProvider):
         return permanent_group_rooms(
             group_player, self._configured_group_rooms(group_player.player_id)
         )
+
+    def _pair_rooms(self, player_ids: list[str]) -> dict[str, Player]:
+        """
+        Return the two speakers of a new stereo pair, once they're checked to fit one.
+
+        :param player_ids: The two speakers asked for.
+        :raises InvalidDataError: with a message an app can show as is.
+        """
+        if len(player_ids) != 2 or player_ids[0] == player_ids[1]:
+            msg = "A stereo pair needs two different speakers"
+            raise InvalidDataError(msg)
+        rooms: dict[str, Player] = {}
+        for player_id in player_ids:
+            room = self.mass.players.get_player(player_id)
+            if room is None or room.state.type != PlayerType.PLAYER or not room.state.available:
+                msg = f"{room.state.name if room else player_id} is not an available speaker"
+                raise InvalidDataError(msg)
+            rooms[player_id] = room
+        first, second = rooms.values()
+        if second.player_id not in first.state.can_group_with:
+            msg = f"{first.state.name} and {second.state.name} can't play together"
+            raise InvalidDataError(msg)
+        grouped = {
+            room_id
+            for group_player in self.mass.players.iter_players()
+            if group_player.state.type == PlayerType.GROUP
+            for room_id in self._group_rooms(group_player)
+        }
+        for room in rooms.values():
+            if room.player_id in grouped:
+                msg = f"{room.state.name} is already in a permanent group"
+                raise InvalidDataError(msg)
+            if self._stereo_output(room) is None:
+                msg = f"{room.state.name} has no Sendspin output to play one side on"
+                raise InvalidDataError(msg)
+        return rooms
 
     def _room_side(self, room_id: str) -> str:
         """Return the side a room is set to play: left, right, stereo or mono."""

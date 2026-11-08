@@ -36,11 +36,13 @@ from music_assistant.providers.hass import (
     SPEAKER_LIST_COMMAND,
     SPEAKER_LIST_SET_MEMBERS_COMMAND,
     STATE_FETCH_BATCH_SIZE,
+    STEREO_PAIR_CREATE_COMMAND,
     STEREO_PAIR_IDENTIFY_COMMAND,
     STEREO_PAIR_SET_COMMAND,
     HassPlayerLocations,
     HassRegistryEntity,
     HomeAssistantProvider,
+    StereoPairCreated,
     setup,
 )
 from music_assistant.providers.hass.constants import (
@@ -2222,6 +2224,7 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
     unregister_speaker_list_members = MagicMock()
     unregister_identify = MagicMock()
     unregister_set_stereo = MagicMock()
+    unregister_create_stereo = MagicMock()
     mass.register_api_command = MagicMock(
         side_effect=[
             unregister_search,
@@ -2230,6 +2233,7 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
             unregister_speaker_list_members,
             unregister_identify,
             unregister_set_stereo,
+            unregister_create_stereo,
         ]
     )
     manifest = MagicMock()
@@ -2247,6 +2251,7 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
     unregister_speaker_list_members.assert_called_once()
     unregister_identify.assert_called_once()
     unregister_set_stereo.assert_called_once()
+    unregister_create_stereo.assert_called_once()
 
 
 async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> None:
@@ -2258,6 +2263,7 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
     unregister_speaker_list_members = MagicMock()
     unregister_identify = MagicMock()
     unregister_set_stereo = MagicMock()
+    unregister_create_stereo = MagicMock()
     mass.register_api_command = MagicMock(
         side_effect=[
             unregister_search,
@@ -2266,6 +2272,7 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
             unregister_speaker_list_members,
             unregister_identify,
             unregister_set_stereo,
+            unregister_create_stereo,
         ]
     )
     manifest = MagicMock()
@@ -2322,6 +2329,13 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
     )
     APICommandHandler.parse(STEREO_PAIR_IDENTIFY_COMMAND, provider.identify_stereo_speaker)
     APICommandHandler.parse(STEREO_PAIR_SET_COMMAND, provider.set_stereo_pair)
+    mass.register_api_command.assert_any_call(
+        STEREO_PAIR_CREATE_COMMAND,
+        provider.create_stereo_pair,
+        required_scope=Scope.CONFIG_PLAYERS_WRITE,
+    )
+    handler = APICommandHandler.parse(STEREO_PAIR_CREATE_COMMAND, provider.create_stereo_pair)
+    assert handler.type_hints["return"] is StereoPairCreated
 
     await provider.unload()
 
@@ -2330,6 +2344,7 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
     unregister_speaker_list_members.assert_called_once_with()
     unregister_identify.assert_called_once_with()
     unregister_set_stereo.assert_called_once_with()
+    unregister_create_stereo.assert_called_once_with()
     mass.streams.register_dynamic_route.return_value.assert_called_once_with()
     assert mass.subscribe.return_value.call_count >= 1
 
