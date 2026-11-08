@@ -17,10 +17,10 @@ from functools import partial
 from itertools import batched
 from sys import intern
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, TypedDict, cast
 from urllib.parse import unquote, urlsplit
 
-from aiohttp import ClientResponseError
+from aiohttp import ClientResponseError, web
 from hass_client import HomeAssistantClient
 from hass_client.exceptions import (
     BaseHassClientError,
@@ -32,17 +32,21 @@ from hass_client.exceptions import (
 )
 from hass_client.utils import get_websocket_url
 from music_assistant_models.auth import Scope
-from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
     EventType,
     MediaType,
+    PlaybackState,
+    PlayerType,
     ProviderFeature,
     StreamType,
 )
 from music_assistant_models.errors import (
+    InvalidDataError,
     MusicAssistantError,
+    PlayerCommandFailed,
     ProviderUnavailableError,
     RateLimited,
     SetupFailedError,
@@ -52,8 +56,17 @@ from music_assistant_models.media_items.audio_format import AudioFormat
 from music_assistant_models.player_control import PlayerControl
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant.constants import CONF_VERIFY_SSL, VERBOSE_LOG_LEVEL
+from music_assistant.constants import (
+    ANNOUNCE_ALERT_FILE,
+    CONF_DYNAMIC_GROUP_MEMBERS,
+    CONF_GROUP_MEMBERS,
+    CONF_OUTPUT_CHANNELS,
+    CONF_PREFERRED_OUTPUT_PROTOCOL,
+    CONF_VERIFY_SSL,
+    VERBOSE_LOG_LEVEL,
+)
 from music_assistant.controllers.cache import use_cache
+from music_assistant.controllers.webserver.helpers.auth_middleware import is_own_client_player
 from music_assistant.helpers.datetime import iso_from_utc_timestamp
 from music_assistant.helpers.json import SerializableType
 from music_assistant.helpers.tts import TTSLanguageNotSupportedError, match_tts_language
@@ -62,9 +75,12 @@ from music_assistant.models.plugin import AIEngine, ImageEngine, PluginProvider,
 
 from .constants import (
     CONF_MUTE_CONTROLS,
+    CONF_PLAYER_GROUPING,
     CONF_POWER_CONTROLS,
     CONF_VOLUME_CONTROLS,
+    DEFAULT_PLAYER_GROUPING,
     OFF_STATES,
+    PLAYER_GROUPINGS,
     AITaskEntityFeature,
     MediaPlayerEntityFeature,
     parse_supported_features,
@@ -74,7 +90,14 @@ from .control_entities import (
     ControlEntitySearch,
     HassControlEntitySearchResult,
 )
+from .group_colours import GroupColours, groups_from_players
 from .helpers import ControlCapabilities, get_control_name, is_entity_id
+from .speaker_list import (
+    SpeakerList,
+    build_speaker_list,
+    permanent_group_rooms,
+    stereo_pair_left,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping
@@ -92,11 +115,13 @@ if TYPE_CHECKING:
         State,
     )
     from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.event import MassEvent
     from music_assistant_models.player import PlayerMedia
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
+    from music_assistant.models.player import Player
 
 DOMAIN = "hass"
 CONF_URL = "url"
@@ -112,8 +137,51 @@ ENGINE_REFRESH_DEBOUNCE = 2
 DEVICE_REGISTRY_CACHE_TTL = 60
 # areas are renamed even less often than devices, and only ever supply a label
 AREA_REGISTRY_CACHE_TTL = 60
+# floors and labels change as rarely as areas and serve the same purpose
+FLOOR_REGISTRY_CACHE_TTL = 60
+LABEL_REGISTRY_CACHE_TTL = 60
 
 SEARCH_CONTROL_ENTITIES_COMMAND = f"{DOMAIN}/search_control_entities"
+PLAYER_LOCATIONS_COMMAND = f"{DOMAIN}/player_locations"
+SPEAKER_LIST_COMMAND = f"{DOMAIN}/speaker_list"
+SPEAKER_LIST_SET_MEMBERS_COMMAND = f"{DOMAIN}/speaker_list/set_members"
+# how long a permanent group's ended session may take to let go of its rooms, and how often
+# to look, before they join another group
+GROUP_RELEASE_TIMEOUT = 5.0
+GROUP_RELEASE_POLL = 0.2
+STEREO_PAIR_IDENTIFY_COMMAND = f"{DOMAIN}/stereo_pair/identify"
+STEREO_PAIR_SET_COMMAND = f"{DOMAIN}/stereo_pair/set"
+STEREO_PAIR_CREATE_COMMAND = f"{DOMAIN}/stereo_pair/create"
+# the provider that keeps permanent groups (sync groups), which a new stereo pair is made in
+SYNC_GROUP_DOMAIN = "sync_group"
+# the sound a speaker plays so the user can tell which one it is, served on the stream server
+IDENTIFY_SOUND_PATH = f"/{DOMAIN}/identify.mp3"
+# the output protocol that builds each speaker's audio itself, so each plays its own side
+STEREO_PAIR_PROTOCOL = "sendspin"
+AREAS_COMMAND = f"{DOMAIN}/areas"
+AREAS_SET_PLAYER_COMMAND = f"{DOMAIN}/areas/set_player"
+AREAS_CREATE_COMMAND = f"{DOMAIN}/areas/create"
+# Music Assistant's own copy of the Home Assistant area a player is in. A player not
+# exposed to Home Assistant has no device there to hold its area, so the copy places it.
+# None: never set; "": deliberately in no area.
+CONF_PLAYER_AREA = "hass_area_id"
+# window to collect registry and player changes in before the area copies are brought in line
+AREA_SYNC_DEBOUNCE = 2.0
+# clients hear of a changed speaker list through a provider event under this sub scope
+SPEAKER_LIST_EVENT_SCOPE = "speaker_list"
+# window to collect changes in, so a burst of player or registry updates sends one event
+SPEAKER_LIST_DEBOUNCE = 1.0
+# Home Assistant registry events that can move a player to another area, floor or label,
+# with the cached listing each one makes stale
+LOCATION_REGISTRY_EVENTS: Final = {
+    "device_registry_updated": "_fetch_device_registry",
+    "area_registry_updated": "_fetch_area_registry",
+    "floor_registry_updated": "_fetch_floor_registry",
+    "label_registry_updated": "_fetch_label_registry",
+}
+# the integration domain under which Home Assistant's Music Assistant integration
+# registers a device (and its media_player entity) for every Music Assistant player
+HASS_MUSIC_ASSISTANT_DOMAIN = "music_assistant"
 
 # HA paths a media player's entity_picture points at, the only images this provider resolves
 IMAGE_PATH_PREFIXES: Final = (
@@ -136,7 +204,7 @@ FEATURE_DOMAIN_PREFIXES = tuple(f"{domain}." for domain in FEATURE_DOMAINS)
 # config_entry_id joins them because Home Assistant can clear disabled_by while reporting
 # only the move to the other config entry.
 REGISTRY_FIELDS_AFFECTING_MIRROR = frozenset(
-    {"entity_id", "platform", "device_id", "area_id", "disabled_by", "config_entry_id"}
+    {"entity_id", "platform", "device_id", "area_id", "labels", "disabled_by", "config_entry_id"}
 )
 
 
@@ -160,6 +228,28 @@ class HassRegistryEntity(NamedTuple):
     device_id: str | None
     # the area the entity is assigned to directly, overriding the one of its device
     area_id: str | None
+    # the ids of the labels on the entity itself, not those on its device
+    labels: tuple[str, ...] = ()
+
+
+class HassPlayerLocation(TypedDict):
+    """Where a Music Assistant player is placed in Home Assistant, by name."""
+
+    area: str | None
+    floor: str | None
+    floor_level: int | None
+    # the labels on the player's entity and on its device, sorted by name
+    labels: list[str]
+
+
+class HassPlayerLocations(TypedDict):
+    """Result of the player locations command, keyed by player ID."""
+
+    # how the household wants speaker lists grouped, as set in the provider settings
+    grouping: Literal["floor", "area", "label", "none"]
+    players: dict[str, HassPlayerLocation]
+    # the colour of every sync group the user can see the leader of, keyed by leader ID
+    group_colours: dict[str, str]
 
 
 async def setup(
@@ -182,6 +272,74 @@ def _control_config_entries() -> tuple[ConfigEntry, ...]:
         )
         for conf_key in (CONF_POWER_CONTROLS, CONF_VOLUME_CONTROLS, CONF_MUTE_CONTROLS)
     )
+
+
+def _grouping_config_entry() -> ConfigEntry:
+    """Return the config entry holding how speaker lists group the players."""
+    return ConfigEntry(
+        key=CONF_PLAYER_GROUPING,
+        type=ConfigEntryType.STRING,
+        label=CONF_PLAYER_GROUPING,
+        options=[ConfigValueOption(grouping) for grouping in PLAYER_GROUPINGS],
+        default_value=DEFAULT_PLAYER_GROUPING,
+        required=False,
+        # applied in place by update_config, without reconnecting to Home Assistant
+        requires_reload=False,
+    )
+
+
+class StereoPairCreated(TypedDict):
+    """The stereo pair hass/stereo_pair/create made."""
+
+    group_id: str
+
+
+class HassFloor(TypedDict):
+    """A Home Assistant floor, as a room picker lists it."""
+
+    floor_id: str
+    name: str
+    level: int | None
+
+
+class HassArea(TypedDict):
+    """A Home Assistant area (a room), as a room picker lists it."""
+
+    area_id: str
+    name: str
+    floor_id: str | None
+
+
+class HassAreas(TypedDict):
+    """Result of hass/areas: the rooms to pick from, and the room each player is in."""
+
+    # in the order Home Assistant keeps them
+    floors: list[HassFloor]
+    areas: list[HassArea]
+    # the area ID of every player the user can see, None when in no (known) area
+    player_areas: dict[str, str | None]
+
+
+class HassAreaCreated(TypedDict):
+    """The area hass/areas/create made, and the floor it is on."""
+
+    area_id: str
+    floor_id: str | None
+
+
+class _PlayerDevice(NamedTuple):
+    """The Home Assistant device of a player, with where it and its media_player are placed."""
+
+    device_id: str
+    area_id: str | None
+    entity_id: str | None
+    # the area set on the media_player entity itself, which overrides the device's
+    entity_area_id: str | None
+
+    @property
+    def placed_in(self) -> str | None:
+        """Return the area Home Assistant places the player in."""
+        return self.entity_area_id or self.area_id
 
 
 class HomeAssistantProvider(PluginProvider):
@@ -207,6 +365,23 @@ class HomeAssistantProvider(PluginProvider):
     _control_reconcile_lock: asyncio.Lock
     _control_entity_search: ControlEntitySearch
     _unregister_search_command: Callable[[], None] | None = None
+    _unregister_locations_command: Callable[[], None] | None = None
+    _unsubscribe_player_events: Callable[[], None] | None = None
+    _group_colours: GroupColours | None = None
+    _unregister_speaker_list_command: Callable[[], None] | None = None
+    _unregister_speaker_list_members_command: Callable[[], None] | None = None
+    _unregister_stereo_pair_commands: list[Callable[[], None]] | None = None
+    # the stereo pairs playing when the players last changed, to match their volumes on a start
+    _playing_stereo_pairs: frozenset[str] = frozenset()
+    _unsubscribe_location_registries: list[Callable[[], None]] | None = None
+    # bumped (and announced) whenever the speaker list may look different
+    _speaker_list_revision: int = 0
+    # what the speaker list was last built from, to tell a relevant player change apart
+    _speaker_list_players: frozenset[tuple[Any, ...]] | None = None
+    _unregister_area_commands: list[Callable[[], None]] | None = None
+    # the players' Home Assistant devices seen since connecting: a device not seen before
+    # (a player just exposed to Home Assistant) takes Music Assistant's copy of its area
+    _area_devices: frozenset[str] = frozenset()
 
     @property
     def url(self) -> str | None:
@@ -265,7 +440,7 @@ class HomeAssistantProvider(PluginProvider):
             # url/token/verify_ssl are collected by the setup flow instead (see setup_flow.py)
             base_entries = ()
 
-        return (*base_entries, *_control_config_entries())
+        return (*base_entries, *_control_config_entries(), _grouping_config_entry())
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the plugin."""
@@ -289,13 +464,9 @@ class HomeAssistantProvider(PluginProvider):
         self._entity_registry = None
         self._entity_registry_lock = asyncio.Lock()
         self._control_entity_search = ControlEntitySearch(self)
-        # registering here rather than in loaded_in_mass pairs the command with the teardown
-        # in _disconnect_hass, so a reload can never leave it registered twice
-        self._unregister_search_command = self.mass.register_api_command(
-            SEARCH_CONTROL_ENTITIES_COMMAND,
-            self.search_control_entities,
-            required_scope=Scope.CONFIG_PROVIDERS_READ,
-        )
+        # registering here rather than in loaded_in_mass pairs the commands with the teardown
+        # in _disconnect_hass, so a reload can never leave them registered twice
+        self._register_api_commands()
         try:
             await self.hass.connect()
         except asyncio.CancelledError:
@@ -311,6 +482,7 @@ class HomeAssistantProvider(PluginProvider):
             # registry change can slip through unnoticed; _disconnect_hass tears the
             # subscription down again on the failure paths below
             await self._subscribe_entity_registry()
+            await self._subscribe_location_registries()
             await self._resolve_startup_features()
         except asyncio.CancelledError:
             await self._cleanup_failed_init()
@@ -326,6 +498,7 @@ class HomeAssistantProvider(PluginProvider):
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
         await self._register_player_controls()
+        self._schedule_area_sync()
 
     async def unload(self, is_removed: bool = False) -> None:
         """
@@ -344,9 +517,10 @@ class HomeAssistantProvider(PluginProvider):
         """
         Handle logic when the config is updated.
 
-        A change limited to the player control selection is applied in place, so adding or
-        removing a control does not drop and re-establish the Home Assistant connection.
-        Any other change reloads the provider as usual.
+        A change limited to the player control selection and the player grouping is applied
+        in place, so adding or removing a control, or picking another grouping, does not drop
+        and re-establish the Home Assistant connection. Any other change reloads the provider
+        as usual.
 
         Raises when the in place update fails (because Home Assistant is unreachable, for
         example); the controls are then left as they were and a later update retries.
@@ -358,12 +532,17 @@ class HomeAssistantProvider(PluginProvider):
             f"values/{conf_key}"
             for conf_key in (CONF_POWER_CONTROLS, CONF_VOLUME_CONTROLS, CONF_MUTE_CONTROLS)
         }
-        if not changed_keys or not changed_keys <= control_keys:
+        in_place_keys = {*control_keys, f"values/{CONF_PLAYER_GROUPING}"}
+        if not changed_keys or not changed_keys <= in_place_keys:
             await super().update_config(config, changed_keys)
             return
-        # store the new config before reconciling: the control lists are read back from it
+        # store the new config before reconciling: the control lists are read back from it,
+        # and the grouping is read from it whenever the locations are asked for
         self.config = config
-        await self._register_player_controls()
+        if f"values/{CONF_PLAYER_GROUPING}" in changed_keys:
+            self._speaker_list_changed()
+        if changed_keys & control_keys:
+            await self._register_player_controls()
 
     async def get_diagnostics(self) -> dict[str, SerializableType]:
         """Return diagnostics info for this provider to include in diagnostics reports."""
@@ -432,6 +611,24 @@ class HomeAssistantProvider(PluginProvider):
         AREA_REGISTRY_CACHE_TTL seconds to be reflected.
         """
         return await self._fetch_area_registry()
+
+    async def get_floor_registry(self) -> dict[str, dict[str, Any]]:
+        """
+        Return the Home Assistant floor registry, keyed by floor ID.
+
+        The listing is reused for a short while, so a floor change may take up to
+        FLOOR_REGISTRY_CACHE_TTL seconds to be reflected.
+        """
+        return await self._fetch_floor_registry()
+
+    async def get_label_registry(self) -> dict[str, dict[str, Any]]:
+        """
+        Return the Home Assistant label registry, keyed by label ID.
+
+        The listing is reused for a short while, so a label change may take up to
+        LABEL_REGISTRY_CACHE_TTL seconds to be reflected.
+        """
+        return await self._fetch_label_registry()
 
     async def search_control_entities(
         self,
@@ -648,6 +845,388 @@ class HomeAssistantProvider(PluginProvider):
         except Exception as err:
             self.logger.warning("Failed to get HA user details: %s", err)
             return None, None, None
+
+    async def get_player_locations(self) -> HassPlayerLocations:
+        """
+        Return where each Music Assistant player is placed in Home Assistant.
+
+        Home Assistant's Music Assistant integration registers a device for every player,
+        identified by the player ID, with a media_player entity on it. The player's area is
+        the one assigned to that entity, or else the one of its device, and its floor is the
+        floor of that area. Its labels are those on the entity and on the device.
+
+        Every player the current user can see is listed. A player Home Assistant does not
+        place (such as one not exposed to it, so without a device there) takes the area
+        Music Assistant keeps for it (see set_player_area). Where neither has anything, the
+        fields are None or an empty list. Registry changes can take up to a minute to show.
+        """
+        if not self.hass.connected:
+            msg = "Home Assistant is not connected"
+            raise ProviderUnavailableError(msg)
+        entity_registry, devices, areas, floors, labels = await asyncio.gather(
+            self.get_entity_registry(),
+            self.get_device_registry(),
+            self.get_area_registry(),
+            self.get_floor_registry(),
+            self.get_label_registry(),
+        )
+        device_by_player: dict[str, Mapping[str, Any]] = {}
+        for device in devices.values():
+            for domain, identifier in device.get("identifiers") or ():
+                if domain == HASS_MUSIC_ASSISTANT_DOMAIN:
+                    device_by_player[identifier] = cast("Mapping[str, Any]", device)
+        # other integrations expose the same hardware as separate, unlinked devices, so
+        # only the entities of the Music Assistant integration itself are considered
+        entity_by_device = {
+            entry.device_id: entry
+            for entity_id, entry in entity_registry.items()
+            if entry.platform == HASS_MUSIC_ASSISTANT_DOMAIN
+            and entry.device_id is not None
+            and entity_id.startswith("media_player.")
+        }
+        locations: dict[str, HassPlayerLocation] = {}
+        for player in self.mass.players.all_players():
+            device = device_by_player.get(player.player_id)
+            entity = entity_by_device.get(device["id"]) if device else None
+            locations[player.player_id] = _player_location(
+                device,
+                entity,
+                cast("Mapping[str, Mapping[str, Any]]", areas),
+                floors,
+                labels,
+                self._area_copy(player.player_id),
+            )
+        # the colours are worked out over every player, so all users agree on them, but
+        # only the groups whose leader this user can see are handed out
+        colours = self._refresh_group_colours().colours
+        return {
+            "grouping": self._player_grouping(),
+            "players": locations,
+            "group_colours": {
+                leader_id: colour for leader_id, colour in colours.items() if leader_id in locations
+            },
+        }
+
+    async def get_speaker_list(self) -> SpeakerList:
+        """
+        Return the finished speaker list for the current user, for clients to draw as is.
+
+        The players are sorted into sections by the household's grouping (floor, area,
+        label or none), with "Other" last. Hidden, disabled, protocol and source players
+        are left out, and so are the rooms a permanent group player stands in for; the
+        group player itself is listed as a room. The caller's own client player (such as
+        its web player) is listed even while hidden. Groups made on the fly carry their
+        colour, and their members name their leader. A permanent group counts as one room
+        there too: it is offered to other groups, shows as one member when its rooms join
+        one, and as the leader when one of its rooms leads (see set_speaker_list_members).
+        A dynamic group (Dynamic members on) is a named room too, but its rooms stay
+        listed; while it plays it leads the coloured group of the rooms playing with it.
+
+        Clients are told of a change by a provider event under the sub scope
+        "speaker_list", carrying the new revision, and then ask again.
+        """
+        locations = await self.get_player_locations()
+        everyone = list(self.mass.players.iter_players())
+        visible = self.mass.players.all_players()
+        group_colours = self._refresh_group_colours()
+        dynamic_groups = self._dynamic_group_ids()
+        group_rooms = {
+            player.player_id: self._configured_group_rooms(player.player_id)
+            for player in everyone
+            if player.state.type == PlayerType.GROUP
+        }
+        return build_speaker_list(
+            visible=visible,
+            everyone=everyone,
+            locations=locations["players"],
+            grouping=locations["grouping"],
+            groups=groups_from_players(everyone, dynamic_groups),
+            colours=group_colours.colours,
+            revision=self._speaker_list_revision,
+            own_player_id=next(
+                (player.player_id for player in visible if is_own_client_player(player)), None
+            ),
+            group_rooms=group_rooms,
+            dynamic_groups=dynamic_groups,
+            sides={
+                room_id: self._room_side(room_id)
+                for group_player in everyone
+                if group_player.state.type == PlayerType.GROUP
+                for room_id in permanent_group_rooms(
+                    group_player, group_rooms[group_player.player_id]
+                )
+            },
+        )
+
+    async def set_speaker_list_members(
+        self,
+        target_player: str,
+        player_ids_to_add: list[str] | None = None,
+        player_ids_to_remove: list[str] | None = None,
+    ) -> None:
+        """
+        Join or take out rooms of the speaker list to or from the target player's group.
+
+        Takes the arguments of players/cmd/set_members, with the rooms as the speaker list
+        names them. There a permanent group (a group player, such as a sync group) is one
+        room, but MA core never puts a group player inside another player's group, so a
+        permanent group joins and leaves as the rooms it is set up with. One playing on its
+        own ends that session first, and a room of it that is offline is left out.
+
+        :param target_player: player_id of the group's leader.
+        :param player_ids_to_add: The rooms to add to the leader's group.
+        :param player_ids_to_remove: The rooms to take out of the leader's group.
+        """
+        players = self.mass.players
+        to_add: list[str] = []
+        for player_id in player_ids_to_add or ():
+            group_player = players.get_player(player_id)
+            if (
+                group_player is None
+                or group_player.state.type != PlayerType.GROUP
+                or player_id == target_player
+            ):
+                to_add.append(player_id)
+                continue
+            rooms = self._group_rooms(group_player)
+            if any(
+                (room := players.get_player(room_id)) is not None
+                and room.state.active_group == player_id
+                for room_id in rooms
+            ):
+                # it plays on its own: end that session so its rooms are free to join
+                await players.cmd_ungroup(player_id)
+                await self._wait_rooms_released(player_id, rooms)
+            to_add.extend(
+                room_id
+                for room_id in rooms
+                if (room := players.get_player(room_id)) is not None and room.state.available
+            )
+        to_remove: list[str] = []
+        for player_id in player_ids_to_remove or ():
+            group_player = players.get_player(player_id)
+            if (
+                group_player is None
+                or group_player.state.type != PlayerType.GROUP
+                or player_id == target_player
+            ):
+                to_remove.append(player_id)
+            else:
+                to_remove.extend(self._group_rooms(group_player))
+        await players.cmd_set_members(
+            target_player,
+            player_ids_to_add=list(dict.fromkeys(to_add)) or None,
+            player_ids_to_remove=list(dict.fromkeys(to_remove)) or None,
+        )
+
+    async def identify_stereo_speaker(self, player_id: str) -> None:
+        """
+        Play a short sound on one speaker, so the user can tell which one it is.
+
+        Used while setting up a stereo pair ("Is this your left speaker?"). Returns once the
+        sound is sent, not when it has played, and may be repeated.
+
+        :param player_id: The speaker to play the sound on.
+        """
+        player = self.mass.players.get_player(player_id)
+        if player is None or not player.state.available:
+            msg = f"Speaker {player_id} is not available"
+            raise PlayerCommandFailed(msg)
+        url = f"{self.mass.streams.base_url}{IDENTIFY_SOUND_PATH}"
+        self.mass.create_task(
+            self.mass.players.play_announcement(player_id, url=url, pre_announce=False)
+        )
+
+    async def set_stereo_pair(self, group_id: str, left_player_id: str | None = None) -> None:
+        """
+        Make a permanent group of two speakers a stereo pair, or turn the pair off.
+
+        The left speaker plays only the left side and the other only the right. Both play
+        over their own Sendspin output, which builds each speaker's audio itself: grouped
+        the speaker's own way (such as Sonos's), both would play one shared stream. Both are
+        set to the quieter one's volume; the group's volume then keeps them equal, as it
+        scales each speaker from where it is. The pair stays a permanent group, so it still
+        joins and leads other groups as one room.
+
+        :param group_id: The permanent group of exactly two speakers.
+        :param left_player_id: The speaker on the left, or None to turn the pair off and
+            put both speakers back to stereo.
+        """
+        group_player = self.mass.players.get_player(group_id)
+        if group_player is None or group_player.state.type != PlayerType.GROUP:
+            msg = f"{group_id} is not a permanent group"
+            raise InvalidDataError(msg)
+        rooms = self._group_rooms(group_player)
+        if len(rooms) != 2:
+            msg = "A stereo pair needs a permanent group of exactly two speakers"
+            raise InvalidDataError(msg)
+        if left_player_id is not None and left_player_id not in rooms:
+            msg = f"{left_player_id} is not a speaker of {group_id}"
+            raise InvalidDataError(msg)
+        players = {room_id: self.mass.players.get_player(room_id) for room_id in rooms}
+        if left_player_id is None:
+            for room_id, room in players.items():
+                await self._set_room_side(room_id, room, "stereo", None)
+        else:
+            outputs = {room_id: self._stereo_output(room) for room_id, room in players.items()}
+            if missing := [room_id for room_id, output in outputs.items() if output is None]:
+                msg = f"Speaker {missing[0]} has no Sendspin output to play one side on"
+                raise PlayerCommandFailed(msg)
+            for room_id, room in players.items():
+                side = "left" if room_id == left_player_id else "right"
+                await self._set_room_side(room_id, room, side, outputs[room_id])
+            await self._match_pair_volume(players)
+        self._speaker_list_changed()
+
+    async def create_stereo_pair(
+        self, name: str, player_ids: list[str], left_player_id: str | None = None
+    ) -> StereoPairCreated:
+        """
+        Make a new permanent group of two speakers, to become a stereo pair.
+
+        Everything is checked first, so nothing is made when the two can't be a pair: they
+        must be two different, available speakers that can play together, neither in a
+        permanent group already, and both with a Sendspin output (which a pair plays over).
+        The group is a fixed (permanent) one: it always holds its two speakers and pulls
+        one that drops out back in, and it still takes in other rooms when it leads them.
+        With a left speaker it becomes a stereo pair at once (as set_stereo_pair);
+        without one, the sides are set afterwards.
+
+        :param name: The name of the new pair.
+        :param player_ids: The two speakers.
+        :param left_player_id: The speaker on the left, if already known.
+        """
+        rooms = self._pair_rooms(player_ids)
+        if left_player_id is not None and left_player_id not in player_ids:
+            msg = "The left speaker must be one of the two speakers"
+            raise InvalidDataError(msg)
+        provider = self.mass.get_provider(SYNC_GROUP_DOMAIN)
+        if provider is None:
+            msg = "Music Assistant can't make permanent groups right now"
+            raise PlayerCommandFailed(msg)
+        group_player = await self.mass.players.create_group_player(
+            # fixed (not dynamic): it always holds its two speakers, pulls one that drops
+            # out back in, and still takes in other rooms when it leads them
+            provider.instance_id,
+            name,
+            list(rooms),
+            False,
+        )
+        if set(self._group_rooms(group_player)) != set(rooms):
+            # the group player was made without one of them: leave nothing half made
+            await self.mass.players.remove_group_player(group_player.player_id)
+            msg = "The two speakers could not be put in one group"
+            raise PlayerCommandFailed(msg)
+        if left_player_id is not None:
+            await self.set_stereo_pair(group_player.player_id, left_player_id)
+        else:
+            self._speaker_list_changed()
+        # the pair takes its speakers' room (see _sync_area_copies)
+        self._schedule_area_sync()
+        return {"group_id": group_player.player_id}
+
+    async def get_areas(self) -> HassAreas:
+        """
+        Return Home Assistant's floors and areas (rooms), and the area each player is in.
+
+        For a room picker on a speaker's page: the areas are grouped by floor the way Home
+        Assistant groups them, and a speaker's area is the one Home Assistant places it in,
+        or else the one Music Assistant keeps for it (a speaker not exposed to Home
+        Assistant). Every player the current user can see is listed.
+        """
+        self._require_connected()
+        areas, floors, devices = await asyncio.gather(
+            self.get_area_registry(), self.get_floor_registry(), self._player_devices()
+        )
+        return {
+            "floors": [
+                {
+                    "floor_id": floor["floor_id"],
+                    "name": floor["name"],
+                    "level": floor.get("level"),
+                }
+                for floor in floors.values()
+            ],
+            "areas": [
+                {"area_id": area["area_id"], "name": area["name"], "floor_id": area.get("floor_id")}
+                for area in areas.values()
+            ],
+            "player_areas": {
+                player.player_id: area_id
+                if (area_id := self._known_area(player.player_id, devices)) in areas
+                else None
+                for player in self.mass.players.all_players()
+            },
+        }
+
+    async def set_player_area(self, player_id: str, area_id: str | None = None) -> None:
+        """
+        Put a speaker in a Home Assistant area (a room), or in none.
+
+        The area goes on the speaker's Home Assistant device, as setting it in Home
+        Assistant does, which also puts it on that area's floor; an area set on its
+        media_player entity, which would override the device's, is cleared. Music Assistant
+        keeps a copy too, which places a speaker not exposed to Home Assistant, and goes
+        onto its device once it is exposed.
+
+        :param player_id: The speaker (or group) to place.
+        :param area_id: The Home Assistant area, or None for no area.
+        """
+        self._require_connected()
+        if self.mass.players.get_player(player_id) is None:
+            msg = f"{player_id} is not a speaker"
+            raise InvalidDataError(msg)
+        if area_id is not None and area_id not in await self.get_area_registry():
+            msg = "That room no longer exists in Home Assistant"
+            raise InvalidDataError(msg)
+        self._store_area_copy(player_id, area_id or "")
+        if (device := (await self._player_devices()).get(player_id)) is not None:
+            await self._write_device_area(device, area_id)
+        self._speaker_list_changed()
+
+    async def create_area(
+        self, name: str, floor_id: str | None = None, new_floor_name: str | None = None
+    ) -> HassAreaCreated:
+        """
+        Make a new Home Assistant area (a room), on a floor or on a new floor.
+
+        Like Home Assistant's "Add area": a name and a floor; the rest of an area's fields
+        are set in Home Assistant. The speaker is put in it with set_player_area.
+
+        :param name: The name of the new area.
+        :param floor_id: The floor it is on, if any.
+        :param new_floor_name: The name of a new floor to make for it, instead.
+        :raises InvalidDataError: with a message an app can show as is, such as for a name
+            Home Assistant already has.
+        """
+        self._require_connected()
+        if not (name := name.strip()):
+            msg = "A room needs a name"
+            raise InvalidDataError(msg)
+        if floor_id is not None and new_floor_name is not None:
+            msg = "Pick a floor or name a new one, not both"
+            raise InvalidDataError(msg)
+        if floor_id is not None and floor_id not in await self.get_floor_registry():
+            msg = "That floor no longer exists in Home Assistant"
+            raise InvalidDataError(msg)
+        if new_floor_name is not None and not (new_floor_name := new_floor_name.strip()):
+            msg = "A floor needs a name"
+            raise InvalidDataError(msg)
+        try:
+            if new_floor_name is not None:
+                floor = await self.hass.send_command(
+                    "config/floor_registry/create", name=new_floor_name
+                )
+                floor_id = cast("str", floor["floor_id"])
+                await self.mass.cache.delete("_fetch_floor_registry", provider=self.instance_id)
+            fields: dict[str, Any] = {"name": name}
+            if floor_id is not None:
+                fields["floor_id"] = floor_id
+            area = await self.hass.send_command("config/area_registry/create", **fields)
+        except FailedCommand as err:
+            raise InvalidDataError(str(err) or "Home Assistant could not make the room") from err
+        await self.mass.cache.delete("_fetch_area_registry", provider=self.instance_id)
+        return {"area_id": cast("str", area["area_id"]), "floor_id": floor_id}
 
     async def get_states(
         self,
@@ -1180,6 +1759,28 @@ class HomeAssistantProvider(PluginProvider):
         if unregister := self._unregister_search_command:
             self._unregister_search_command = None
             unregister()
+        if unregister := self._unregister_locations_command:
+            self._unregister_locations_command = None
+            unregister()
+        if unregister := self._unregister_speaker_list_command:
+            self._unregister_speaker_list_command = None
+            unregister()
+        if unregister := self._unregister_speaker_list_members_command:
+            self._unregister_speaker_list_members_command = None
+            unregister()
+        for unregister_stereo in self._unregister_stereo_pair_commands or ():
+            unregister_stereo()
+        self._unregister_stereo_pair_commands = None
+        for unregister_area in self._unregister_area_commands or ():
+            unregister_area()
+        self._unregister_area_commands = None
+        self._area_devices = frozenset()
+        for unsubscribe_registry in self._unsubscribe_location_registries or ():
+            unsubscribe_registry()
+        self._unsubscribe_location_registries = None
+        if unsubscribe := self._unsubscribe_player_events:
+            self._unsubscribe_player_events = None
+            unsubscribe()
         self._control_entity_search.close()
         if unsubscribe := self._unsubscribe_controls:
             self._unsubscribe_controls = None
@@ -1317,6 +1918,9 @@ class HomeAssistantProvider(PluginProvider):
         if _affects_mirrored_registry(data):
             self._entity_registry = None
             self._entity_registry_generation += 1
+            # an entity's area or labels may have changed
+            self._speaker_list_changed()
+            self._schedule_area_sync()
         elif self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
             # the kept mirror rests on which fields Home Assistant reports, so leave a
             # trail that tells a stale entity listing apart from a lookup that never ran
@@ -1373,6 +1977,8 @@ class HomeAssistantProvider(PluginProvider):
                 platform=intern(entry["pl"]),
                 device_id=device_id,
                 area_id=area_id,
+                # a handful of labels is spread over many entities, so share their ids too
+                labels=tuple(intern(label_id) for label_id in entry.get("lb") or ()),
             )
         return MappingProxyType(registry)
 
@@ -1395,6 +2001,497 @@ class HomeAssistantProvider(PluginProvider):
         # the Area TypedDict; get_area_registry restores the type for callers
         return {area["area_id"]: area for area in await self.hass.get_area_registry()}
 
+    @lock
+    @use_cache(expiration=FLOOR_REGISTRY_CACHE_TTL)
+    async def _fetch_floor_registry(self) -> dict[str, Any]:
+        """Fetch the floor registry from Home Assistant, keyed by floor ID."""
+        floors = cast(
+            "list[dict[str, Any]]", await self.hass.send_command("config/floor_registry/list")
+        )
+        return {floor["floor_id"]: floor for floor in floors}
+
+    @lock
+    @use_cache(expiration=LABEL_REGISTRY_CACHE_TTL)
+    async def _fetch_label_registry(self) -> dict[str, Any]:
+        """Fetch the label registry from Home Assistant, keyed by label ID."""
+        labels = cast(
+            "list[dict[str, Any]]", await self.hass.send_command("config/label_registry/list")
+        )
+        return {label["label_id"]: label for label in labels}
+
+    def _register_api_commands(self) -> None:
+        """Expose the provider's API commands and follow the players for them."""
+        self._unregister_search_command = self.mass.register_api_command(
+            SEARCH_CONTROL_ENTITIES_COMMAND,
+            self.search_control_entities,
+            required_scope=Scope.CONFIG_PROVIDERS_READ,
+        )
+        # any signed-in user may see where the players they can see are placed
+        self._unregister_locations_command = self.mass.register_api_command(
+            PLAYER_LOCATIONS_COMMAND,
+            self.get_player_locations,
+            required_scope=Scope.PLAYERS_READ,
+        )
+        self._unregister_speaker_list_command = self.mass.register_api_command(
+            SPEAKER_LIST_COMMAND,
+            self.get_speaker_list,
+            required_scope=Scope.PLAYERS_READ,
+        )
+        # changes groups, so it needs the same right as players/cmd/set_members
+        self._unregister_speaker_list_members_command = self.mass.register_api_command(
+            SPEAKER_LIST_SET_MEMBERS_COMMAND,
+            self.set_speaker_list_members,
+            required_scope=Scope.PLAYERS_CONTROL,
+        )
+        self._unregister_stereo_pair_commands = [
+            # plays a sound on a speaker, like a player command
+            self.mass.register_api_command(
+                STEREO_PAIR_IDENTIFY_COMMAND,
+                self.identify_stereo_speaker,
+                required_scope=Scope.PLAYERS_CONTROL,
+            ),
+            # writes player settings, like config/players/save
+            self.mass.register_api_command(
+                STEREO_PAIR_SET_COMMAND,
+                self.set_stereo_pair,
+                required_scope=Scope.CONFIG_PLAYERS_WRITE,
+            ),
+            # makes a permanent group, like players/create_group_player
+            self.mass.register_api_command(
+                STEREO_PAIR_CREATE_COMMAND,
+                self.create_stereo_pair,
+                required_scope=Scope.CONFIG_PLAYERS_WRITE,
+            ),
+            self.mass.streams.register_dynamic_route(
+                IDENTIFY_SOUND_PATH, self._serve_identify_sound
+            ),
+        ]
+        self._unregister_area_commands = [
+            # any signed-in user may see the rooms, as the player locations
+            self.mass.register_api_command(
+                AREAS_COMMAND, self.get_areas, required_scope=Scope.PLAYERS_READ
+            ),
+            # places a player, a player setting that lives in Home Assistant
+            self.mass.register_api_command(
+                AREAS_SET_PLAYER_COMMAND,
+                self.set_player_area,
+                required_scope=Scope.CONFIG_PLAYERS_WRITE,
+            ),
+            self.mass.register_api_command(
+                AREAS_CREATE_COMMAND,
+                self.create_area,
+                required_scope=Scope.CONFIG_PLAYERS_WRITE,
+            ),
+        ]
+        # follow the sync groups as they change, so a group that changes leader between
+        # two requests for the locations still keeps its colour
+        self._group_colours = GroupColours()
+        self._unsubscribe_player_events = self.mass.subscribe(
+            self._on_player_event,
+            (EventType.PLAYER_ADDED, EventType.PLAYER_UPDATED, EventType.PLAYER_REMOVED),
+        )
+
+    async def _subscribe_location_registries(self) -> None:
+        """Watch the Home Assistant registries that place players, for the speaker list."""
+        for unsubscribe_registry in self._unsubscribe_location_registries or ():
+            unsubscribe_registry()
+        self._unsubscribe_location_registries = [
+            await self.hass.subscribe_events(self._on_location_registry_update, event_type)
+            for event_type in LOCATION_REGISTRY_EVENTS
+        ]
+
+    def _on_location_registry_update(self, event: Event) -> None:
+        """Drop the stale registry listing and announce a changed speaker list."""
+        if cache_key := LOCATION_REGISTRY_EVENTS.get(event["event_type"]):
+            self.mass.create_task(self.mass.cache.delete(cache_key, provider=self.instance_id))
+        self._speaker_list_changed()
+        if event["event_type"] in ("device_registry_updated", "area_registry_updated"):
+            self._schedule_area_sync()
+
+    def _on_player_event(self, event: MassEvent) -> None:
+        """Follow a change to the players, which may start, change or end a sync group."""
+        if event.event == EventType.PLAYER_ADDED:
+            # a new group takes its rooms' area, a returning player its kept one
+            self._schedule_area_sync()
+        self._refresh_group_colours()
+        self._match_starting_stereo_pairs()
+        # most player updates (volume, position) leave the speaker list as it is
+        players = frozenset(
+            (
+                state.player_id,
+                state.name,
+                state.type,
+                state.enabled,
+                state.available,
+                state.hide_in_ui,
+                state.private,
+                tuple(state.group_members),
+                tuple(state.static_group_members),
+                state.synced_to,
+                state.active_group,
+                tuple(sorted(state.can_group_with)),
+            )
+            for state in (player.state for player in self.mass.players.iter_players())
+        )
+        if players != self._speaker_list_players:
+            self._speaker_list_players = players
+            self._speaker_list_changed()
+
+    def _speaker_list_changed(self) -> None:
+        """Announce a changed speaker list once the current burst of changes is over."""
+        self.mass.call_later(
+            SPEAKER_LIST_DEBOUNCE,
+            self._signal_speaker_list,
+            task_id=f"{self.instance_id}.{SPEAKER_LIST_EVENT_SCOPE}",
+        )
+
+    def _signal_speaker_list(self) -> None:
+        """Bump the speaker list revision and tell the clients to ask again."""
+        self._speaker_list_revision += 1
+        self.signal_provider_event(
+            {"revision": self._speaker_list_revision}, sub_scope=SPEAKER_LIST_EVENT_SCOPE
+        )
+
+    def _refresh_group_colours(self) -> GroupColours:
+        """Bring the group colours in line with the sync groups as they are now."""
+        if self._group_colours is None:
+            self._group_colours = GroupColours()
+        self._group_colours.update(
+            groups_from_players(self.mass.players.iter_players(), self._dynamic_group_ids())
+        )
+        return self._group_colours
+
+    def _player_grouping(self) -> Literal["floor", "area", "label", "none"]:
+        """Return the configured player grouping, falling back to none for an unknown value."""
+        grouping = self.config.get_value(CONF_PLAYER_GROUPING, DEFAULT_PLAYER_GROUPING)
+        if grouping not in PLAYER_GROUPINGS:
+            # a hand-edited setting, or one a later version added, is not passed on as is:
+            # clients only know these four
+            grouping = DEFAULT_PLAYER_GROUPING
+        return cast("Literal['floor', 'area', 'label', 'none']", grouping)
+
+    def _configured_group_rooms(self, group_id: str) -> list[str] | None:
+        """Return the rooms a group player is set up with, or None if it has no such setting."""
+        configured = self.mass.config.get_raw_player_config_value(group_id, CONF_GROUP_MEMBERS)
+        if not isinstance(configured, list):
+            return None
+        return [str(room_id) for room_id in configured]
+
+    def _group_rooms(self, group_player: Player) -> list[str]:
+        """Return the rooms a permanent group stands in for, as the speaker list has them."""
+        return permanent_group_rooms(
+            group_player, self._configured_group_rooms(group_player.player_id)
+        )
+
+    def _dynamic_group_ids(self) -> frozenset[str]:
+        """Return the IDs of the dynamic group players (Dynamic members on)."""
+        return frozenset(
+            player.player_id
+            for player in self.mass.players.iter_players()
+            if player.type == PlayerType.GROUP
+            and self.mass.config.get_raw_player_config_value(
+                player.player_id, CONF_DYNAMIC_GROUP_MEMBERS
+            )
+        )
+
+    def _pair_rooms(self, player_ids: list[str]) -> dict[str, Player]:
+        """
+        Return the two speakers of a new stereo pair, once they're checked to fit one.
+
+        :param player_ids: The two speakers asked for.
+        :raises InvalidDataError: with a message an app can show as is.
+        """
+        if len(player_ids) != 2 or player_ids[0] == player_ids[1]:
+            msg = "A stereo pair needs two different speakers"
+            raise InvalidDataError(msg)
+        rooms: dict[str, Player] = {}
+        for player_id in player_ids:
+            room = self.mass.players.get_player(player_id)
+            if room is None or room.state.type != PlayerType.PLAYER or not room.state.available:
+                msg = f"{room.state.name if room else player_id} is not an available speaker"
+                raise InvalidDataError(msg)
+            rooms[player_id] = room
+        first, second = rooms.values()
+        if second.player_id not in first.state.can_group_with:
+            msg = f"{first.state.name} and {second.state.name} can't play together"
+            raise InvalidDataError(msg)
+        grouped = {
+            room_id
+            for group_player in self.mass.players.iter_players()
+            if group_player.state.type == PlayerType.GROUP
+            for room_id in self._group_rooms(group_player)
+        }
+        for room in rooms.values():
+            if room.player_id in grouped:
+                msg = f"{room.state.name} is already in a permanent group"
+                raise InvalidDataError(msg)
+            if self._stereo_output(room) is None:
+                msg = f"{room.state.name} has no Sendspin output to play one side on"
+                raise InvalidDataError(msg)
+        return rooms
+
+    def _room_side(self, room_id: str) -> str:
+        """Return the side a room is set to play: left, right, stereo or mono."""
+        side = self.mass.config.get_raw_player_config_value(room_id, CONF_OUTPUT_CHANNELS)
+        return str(side or "stereo")
+
+    def _stereo_output(self, room: Player | None) -> str | None:
+        """Return the ID of a room's available Sendspin output, if it has one."""
+        if room is None:
+            return None
+        return next(
+            (
+                output.output_protocol_id
+                for output in room.output_protocols
+                if output.protocol_domain == STEREO_PAIR_PROTOCOL and output.available
+            ),
+            None,
+        )
+
+    async def _set_room_side(
+        self, room_id: str, room: Player | None, side: str, output_id: str | None
+    ) -> None:
+        """
+        Set the side a room plays, and the output it plays over.
+
+        :param room_id: The room (speaker) to set.
+        :param room: The room's player, if it is loaded.
+        :param side: The side to play: left, right or stereo.
+        :param output_id: The output to play a side over, or None to go back to the
+            room's own output.
+        """
+        if output_id is not None:
+            preferred = output_id
+        elif room is not None and any(output.is_native for output in room.output_protocols):
+            preferred = "native"
+        else:
+            preferred = "auto"
+        await self.mass.config.save_player_config(
+            room_id,
+            {CONF_OUTPUT_CHANNELS: side, CONF_PREFERRED_OUTPUT_PROTOCOL: preferred},
+        )
+        # the output builds the room's audio, so it reads the side from its own settings
+        for output in room.output_protocols if room is not None else ():
+            if output.is_native or output.protocol_domain != STEREO_PAIR_PROTOCOL:
+                continue
+            await self.mass.config.save_player_config(
+                output.output_protocol_id, {CONF_OUTPUT_CHANNELS: side}
+            )
+
+    async def _match_pair_volume(self, rooms: Mapping[str, Player | None]) -> None:
+        """
+        Set both speakers of a stereo pair to the quieter one's volume.
+
+        The quieter one, so that neither gets suddenly loud. Left as it is when a
+        speaker reports no volume. Done when the pair is set up and each time it starts
+        playing, so a change made to one speaker on its own (such as in the Sonos app)
+        doesn't leave one side louder.
+
+        :param rooms: The pair's speakers, keyed by ID.
+        """
+        levels = {
+            room_id: room.state.volume_level
+            for room_id, room in rooms.items()
+            if room is not None and room.state.volume_level is not None
+        }
+        if len(levels) != len(rooms):
+            return
+        target = min(levels.values())
+        for room_id, level in levels.items():
+            if level != target:
+                await self.mass.players.cmd_volume_set(room_id, target)
+
+    def _match_starting_stereo_pairs(self) -> None:
+        """Match the volumes of each stereo pair that has just started playing."""
+        playing: set[str] = set()
+        for player in self.mass.players.iter_players():
+            if (
+                player.state.type != PlayerType.GROUP
+                or player.state.playback_state != PlaybackState.PLAYING
+            ):
+                continue
+            rooms = self._group_rooms(player)
+            if stereo_pair_left(rooms, {room_id: self._room_side(room_id) for room_id in rooms}):
+                playing.add(player.player_id)
+                if player.player_id not in self._playing_stereo_pairs:
+                    self.mass.create_task(
+                        self._match_pair_volume(
+                            {room_id: self.mass.players.get_player(room_id) for room_id in rooms}
+                        )
+                    )
+        self._playing_stereo_pairs = frozenset(playing)
+
+    async def _serve_identify_sound(self, request: web.Request) -> web.FileResponse:
+        """Serve the sound a speaker plays to tell the user which one it is."""
+        return web.FileResponse(ANNOUNCE_ALERT_FILE, headers={"Cache-Control": "no-store"})
+
+    async def _wait_rooms_released(self, group_id: str, room_ids: list[str]) -> None:
+        """
+        Wait a little for a permanent group's ended session to let go of its rooms.
+
+        :param group_id: The permanent group whose session was ended.
+        :param room_ids: The rooms it is set up with.
+        """
+        try:
+            async with asyncio.timeout(GROUP_RELEASE_TIMEOUT):
+                while any(
+                    (room := self.mass.players.get_player(room_id)) is not None
+                    and (
+                        room.state.active_group == group_id
+                        or (room.state.synced_to is not None and room.state.synced_to in room_ids)
+                    )
+                    for room_id in room_ids
+                ):
+                    await asyncio.sleep(GROUP_RELEASE_POLL)
+        except TimeoutError as err:
+            # nothing was added yet, so the group is not half joined
+            msg = f"Group {group_id} did not let go of its rooms in time"
+            raise PlayerCommandFailed(msg) from err
+
+    def _require_connected(self) -> None:
+        """Raise when Home Assistant is not connected."""
+        if not self.hass.connected:
+            msg = "Home Assistant is not connected"
+            raise ProviderUnavailableError(msg)
+
+    async def _player_devices(self) -> dict[str, _PlayerDevice]:
+        """Return the Home Assistant device of every player that has one, keyed by player ID."""
+        entity_registry, devices = await asyncio.gather(
+            self.get_entity_registry(), self.get_device_registry()
+        )
+        # as get_player_locations: only the Music Assistant integration's own media_player
+        entity_of_device = {
+            entry.device_id: (entity_id, entry)
+            for entity_id, entry in entity_registry.items()
+            if entry.platform == HASS_MUSIC_ASSISTANT_DOMAIN
+            and entry.device_id is not None
+            and entity_id.startswith("media_player.")
+        }
+        result: dict[str, _PlayerDevice] = {}
+        for device in devices.values():
+            for domain, identifier in device.get("identifiers") or ():
+                if domain != HASS_MUSIC_ASSISTANT_DOMAIN:
+                    continue
+                entity_id, entry = entity_of_device.get(device["id"], (None, None))
+                result[identifier] = _PlayerDevice(
+                    device_id=device["id"],
+                    area_id=device.get("area_id"),
+                    entity_id=entity_id,
+                    entity_area_id=entry.area_id if entry else None,
+                )
+        return result
+
+    def _area_copy(self, player_id: str) -> str | None:
+        """Return the area Music Assistant keeps for a player, or None if it keeps none."""
+        stored = self.mass.config.get_raw_player_config_value(player_id, CONF_PLAYER_AREA)
+        return stored if isinstance(stored, str) and stored else None
+
+    def _known_area(self, player_id: str, devices: Mapping[str, _PlayerDevice]) -> str | None:
+        """Return the area Home Assistant places a player in, or else the kept one."""
+        device = devices.get(player_id)
+        return (device.placed_in if device else None) or self._area_copy(player_id)
+
+    def _store_area_copy(self, player_id: str, area_id: str) -> None:
+        """
+        Keep a player's area ("" for deliberately none) in Music Assistant's settings.
+
+        :param player_id: The player to keep the area of.
+        :param area_id: The area ID, or "" for no area.
+        """
+        try:
+            self.mass.config.set_raw_player_config_value(player_id, CONF_PLAYER_AREA, area_id)
+        except KeyError:
+            # a player with no stored settings yet; the next sync keeps it
+            self.logger.debug("No settings to keep the area of %s in yet", player_id)
+
+    async def _write_device_area(self, device: _PlayerDevice, area_id: str | None) -> None:
+        """
+        Put a player's Home Assistant device in an area, as Home Assistant's own setting does.
+
+        :param device: The player's device.
+        :param area_id: The area, or None for none.
+        """
+        self._area_devices |= {device.device_id}
+        if device.area_id != area_id:
+            await self.hass.send_command(
+                "config/device_registry/update", device_id=device.device_id, area_id=area_id
+            )
+        if device.entity_id and device.entity_area_id and device.entity_area_id != area_id:
+            # the entity's own area would override the device's
+            await self.hass.send_command(
+                "config/entity_registry/update", entity_id=device.entity_id, area_id=None
+            )
+        await self.mass.cache.delete("_fetch_device_registry", provider=self.instance_id)
+
+    def _schedule_area_sync(self) -> None:
+        """Bring the kept areas in line once the current burst of changes is over."""
+        self.mass.call_later(
+            AREA_SYNC_DEBOUNCE,
+            self._sync_area_copies,
+            task_id=f"{self.instance_id}.area_sync",
+        )
+
+    async def _sync_area_copies(self) -> None:
+        """
+        Keep Music Assistant's copy of each player's area in line with Home Assistant.
+
+        Home Assistant leads for a player it has a device for: the copy follows its area,
+        so the player keeps its room when it is no longer exposed. A device seen for the
+        first time (a player just exposed, or the first look since connecting) without an
+        area takes the copy; one seen before that lost its area was taken out of it in Home
+        Assistant, so the copy is cleared too. A group never placed takes the area its rooms
+        share, if they share one.
+        """
+        if not self.hass.connected:
+            return
+        try:
+            devices = await self._player_devices()
+            areas = await self.get_area_registry()
+            for player in list(self.mass.players.iter_players()):
+                await self._sync_area_copy(player, devices, areas)
+        except (BaseHassClientError, MusicAssistantError) as err:
+            self.logger.warning("Could not bring the speakers' rooms in line: %s", err)
+
+    async def _sync_area_copy(
+        self,
+        player: Player,
+        devices: Mapping[str, _PlayerDevice],
+        areas: Mapping[str, Any],
+    ) -> None:
+        """
+        Bring one player's kept area in line with Home Assistant (see _sync_area_copies).
+
+        :param player: The player.
+        :param devices: The players' Home Assistant devices, keyed by player ID.
+        :param areas: The area registry, keyed by area ID.
+        """
+        player_id = player.player_id
+        stored = self.mass.config.get_raw_player_config_value(player_id, CONF_PLAYER_AREA)
+        device = devices.get(player_id)
+        first_sight = device is not None and device.device_id not in self._area_devices
+        if device is not None:
+            self._area_devices |= {device.device_id}
+            if (placed_in := device.placed_in) is not None:
+                if placed_in != stored:
+                    self._store_area_copy(player_id, placed_in)
+                    self._speaker_list_changed()
+                return
+        inherited = False
+        if stored is None and player.state.type == PlayerType.GROUP:
+            rooms = {self._known_area(room_id, devices) for room_id in self._group_rooms(player)}
+            if len(rooms) == 1 and (shared := rooms.pop()) is not None:
+                stored, inherited = shared, True
+                self._store_area_copy(player_id, shared)
+                self._speaker_list_changed()
+        if device is None or not isinstance(stored, str) or not stored:
+            return
+        if (first_sight or inherited) and stored in areas:
+            await self._write_device_area(device, stored)
+        elif not first_sight:
+            # Home Assistant took the player out of its area
+            self._store_area_copy(player_id, "")
+            self._speaker_list_changed()
+
 
 def _supports_image_generation(state: State) -> bool:
     """Return whether an ai_task entity state advertises image generation."""
@@ -1402,6 +2499,48 @@ def _supports_image_generation(state: State) -> bool:
     if not isinstance(raw_value, int) or isinstance(raw_value, bool):
         return False
     return AITaskEntityFeature.GENERATE_IMAGE in AITaskEntityFeature(raw_value)
+
+
+def _player_location(
+    device: Mapping[str, Any] | None,
+    entity: HassRegistryEntity | None,
+    areas: Mapping[str, Mapping[str, Any]],
+    floors: Mapping[str, Mapping[str, Any]],
+    labels: Mapping[str, Mapping[str, Any]],
+    area_copy: str | None = None,
+) -> HassPlayerLocation:
+    """
+    Return the location of a player from its Home Assistant device and media_player entity.
+
+    :param device: The player's device, or None when Home Assistant has none for it.
+    :param entity: The media_player entity on that device, or None when it has none.
+    :param areas: The area registry, keyed by area ID.
+    :param floors: The floor registry, keyed by floor ID.
+    :param labels: The label registry, keyed by label ID.
+    :param area_copy: The area Music Assistant keeps for the player, used when Home
+        Assistant places it nowhere.
+    """
+    # an area assigned to the entity overrides the one of its device
+    area_id = (
+        (entity.area_id if entity else None)
+        or (device.get("area_id") if device else None)
+        or area_copy
+    )
+    area = areas.get(area_id) if area_id else None
+    floor_id = area.get("floor_id") if area else None
+    floor = floors.get(floor_id) if floor_id else None
+    label_ids = {
+        *(entity.labels if entity else ()),
+        *((device.get("labels") or ()) if device else ()),
+    }
+    # ids the label registry does not know (yet) are left out rather than shown as an id
+    label_names = {labels[label_id]["name"] for label_id in label_ids if label_id in labels}
+    return {
+        "area": area["name"] if area else None,
+        "floor": floor["name"] if floor else None,
+        "floor_level": floor.get("level") if floor else None,
+        "labels": sorted(label_names, key=str.casefold),
+    }
 
 
 def _affects_mirrored_registry(data: Mapping[str, Any]) -> bool:
@@ -1414,7 +2553,7 @@ def _affects_mirrored_registry(data: Mapping[str, Any]) -> bool:
         # a created or removed entity always enters or leaves the listing
         return True
     # an update reports the fields it touched, so a change that only concerns fields we do
-    # not mirror (a rename, an icon, a label) leaves our listing accurate. an update can also
+    # not mirror (a rename, an icon) leaves our listing accurate. an update can also
     # report no fields at all, as a device rename re-derives a name field that Home Assistant
     # strips from the report, so treat that as a change of unknown reach
     if not (changes := data.get("changes")):
