@@ -82,7 +82,9 @@ def _provider(
         config=config,
         streams=SimpleNamespace(base_url="http://ma.local:8097"),
         create_task=MagicMock(side_effect=lambda coro: coro.close()),
+        call_later=MagicMock(),
     )
+    provider.config = SimpleNamespace(instance_id="hass--test")  # type: ignore[assignment]
     provider.logger = logging.getLogger("test.hass")
     provider._speaker_list_changed = MagicMock()  # type: ignore[method-assign]
     return provider
@@ -392,6 +394,8 @@ async def test_create_makes_a_dynamic_group_of_the_two() -> None:
     )
     provider.mass.config.save_player_config.assert_not_awaited()
     provider._speaker_list_changed.assert_called_once_with()
+    # the new pair then takes its speakers' room
+    assert provider.mass.call_later.call_args[0][1] == provider._sync_area_copies
 
 
 async def test_create_with_a_left_speaker_pairs_at_once() -> None:

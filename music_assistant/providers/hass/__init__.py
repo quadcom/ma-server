@@ -157,6 +157,15 @@ SYNC_GROUP_DOMAIN = "sync_group"
 IDENTIFY_SOUND_PATH = f"/{DOMAIN}/identify.mp3"
 # the output protocol that builds each speaker's audio itself, so each plays its own side
 STEREO_PAIR_PROTOCOL = "sendspin"
+AREAS_COMMAND = f"{DOMAIN}/areas"
+AREAS_SET_PLAYER_COMMAND = f"{DOMAIN}/areas/set_player"
+AREAS_CREATE_COMMAND = f"{DOMAIN}/areas/create"
+# Music Assistant's own copy of the Home Assistant area a player is in. A player not
+# exposed to Home Assistant has no device there to hold its area, so the copy places it.
+# None: never set; "": deliberately in no area.
+CONF_PLAYER_AREA = "hass_area_id"
+# window to collect registry and player changes in before the area copies are brought in line
+AREA_SYNC_DEBOUNCE = 2.0
 # clients hear of a changed speaker list through a provider event under this sub scope
 SPEAKER_LIST_EVENT_SCOPE = "speaker_list"
 # window to collect changes in, so a burst of player or registry updates sends one event
@@ -284,6 +293,54 @@ class StereoPairCreated(TypedDict):
     group_id: str
 
 
+class HassFloor(TypedDict):
+    """A Home Assistant floor, as a room picker lists it."""
+
+    floor_id: str
+    name: str
+    level: int | None
+
+
+class HassArea(TypedDict):
+    """A Home Assistant area (a room), as a room picker lists it."""
+
+    area_id: str
+    name: str
+    floor_id: str | None
+
+
+class HassAreas(TypedDict):
+    """Result of hass/areas: the rooms to pick from, and the room each player is in."""
+
+    # in the order Home Assistant keeps them
+    floors: list[HassFloor]
+    areas: list[HassArea]
+    # the area ID of every player the user can see, None when in no (known) area
+    player_areas: dict[str, str | None]
+
+
+class HassAreaCreated(TypedDict):
+    """The area hass/areas/create made, and the floor it is on."""
+
+    area_id: str
+    floor_id: str | None
+
+
+class _PlayerDevice(NamedTuple):
+    """The Home Assistant device of a player, with where it and its media_player are placed."""
+
+    device_id: str
+    area_id: str | None
+    entity_id: str | None
+    # the area set on the media_player entity itself, which overrides the device's
+    entity_area_id: str | None
+
+    @property
+    def placed_in(self) -> str | None:
+        """Return the area Home Assistant places the player in."""
+        return self.entity_area_id or self.area_id
+
+
 class HomeAssistantProvider(PluginProvider):
     """Home Assistant Plugin for Music Assistant."""
 
@@ -320,6 +377,10 @@ class HomeAssistantProvider(PluginProvider):
     _speaker_list_revision: int = 0
     # what the speaker list was last built from, to tell a relevant player change apart
     _speaker_list_players: frozenset[tuple[Any, ...]] | None = None
+    _unregister_area_commands: list[Callable[[], None]] | None = None
+    # the players' Home Assistant devices seen since connecting: a device not seen before
+    # (a player just exposed to Home Assistant) takes Music Assistant's copy of its area
+    _area_devices: frozenset[str] = frozenset()
 
     @property
     def url(self) -> str | None:
@@ -436,6 +497,7 @@ class HomeAssistantProvider(PluginProvider):
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
         await self._register_player_controls()
+        self._schedule_area_sync()
 
     async def unload(self, is_removed: bool = False) -> None:
         """
@@ -792,8 +854,9 @@ class HomeAssistantProvider(PluginProvider):
         the one assigned to that entity, or else the one of its device, and its floor is the
         floor of that area. Its labels are those on the entity and on the device.
 
-        Every player the current user can see is listed. Where Home Assistant has nothing,
-        such as a player without a device in Home Assistant or a device without an area, the
+        Every player the current user can see is listed. A player Home Assistant does not
+        place (such as one not exposed to it, so without a device there) takes the area
+        Music Assistant keeps for it (see set_player_area). Where neither has anything, the
         fields are None or an empty list. Registry changes can take up to a minute to show.
         """
         if not self.hass.connected:
@@ -825,7 +888,12 @@ class HomeAssistantProvider(PluginProvider):
             device = device_by_player.get(player.player_id)
             entity = entity_by_device.get(device["id"]) if device else None
             locations[player.player_id] = _player_location(
-                device, entity, cast("Mapping[str, Mapping[str, Any]]", areas), floors, labels
+                device,
+                entity,
+                cast("Mapping[str, Mapping[str, Any]]", areas),
+                floors,
+                labels,
+                self._area_copy(player.player_id),
             )
         # the colours are worked out over every player, so all users agree on them, but
         # only the groups whose leader this user can see are handed out
@@ -1042,7 +1110,112 @@ class HomeAssistantProvider(PluginProvider):
             await self.set_stereo_pair(group_player.player_id, left_player_id)
         else:
             self._speaker_list_changed()
+        # the pair takes its speakers' room (see _sync_area_copies)
+        self._schedule_area_sync()
         return {"group_id": group_player.player_id}
+
+    async def get_areas(self) -> HassAreas:
+        """
+        Return Home Assistant's floors and areas (rooms), and the area each player is in.
+
+        For a room picker on a speaker's page: the areas are grouped by floor the way Home
+        Assistant groups them, and a speaker's area is the one Home Assistant places it in,
+        or else the one Music Assistant keeps for it (a speaker not exposed to Home
+        Assistant). Every player the current user can see is listed.
+        """
+        self._require_connected()
+        areas, floors, devices = await asyncio.gather(
+            self.get_area_registry(), self.get_floor_registry(), self._player_devices()
+        )
+        return {
+            "floors": [
+                {
+                    "floor_id": floor["floor_id"],
+                    "name": floor["name"],
+                    "level": floor.get("level"),
+                }
+                for floor in floors.values()
+            ],
+            "areas": [
+                {"area_id": area["area_id"], "name": area["name"], "floor_id": area.get("floor_id")}
+                for area in areas.values()
+            ],
+            "player_areas": {
+                player.player_id: area_id
+                if (area_id := self._known_area(player.player_id, devices)) in areas
+                else None
+                for player in self.mass.players.all_players()
+            },
+        }
+
+    async def set_player_area(self, player_id: str, area_id: str | None = None) -> None:
+        """
+        Put a speaker in a Home Assistant area (a room), or in none.
+
+        The area goes on the speaker's Home Assistant device, as setting it in Home
+        Assistant does, which also puts it on that area's floor; an area set on its
+        media_player entity, which would override the device's, is cleared. Music Assistant
+        keeps a copy too, which places a speaker not exposed to Home Assistant, and goes
+        onto its device once it is exposed.
+
+        :param player_id: The speaker (or group) to place.
+        :param area_id: The Home Assistant area, or None for no area.
+        """
+        self._require_connected()
+        if self.mass.players.get_player(player_id) is None:
+            msg = f"{player_id} is not a speaker"
+            raise InvalidDataError(msg)
+        if area_id is not None and area_id not in await self.get_area_registry():
+            msg = "That room no longer exists in Home Assistant"
+            raise InvalidDataError(msg)
+        self._store_area_copy(player_id, area_id or "")
+        if (device := (await self._player_devices()).get(player_id)) is not None:
+            await self._write_device_area(device, area_id)
+        self._speaker_list_changed()
+
+    async def create_area(
+        self, name: str, floor_id: str | None = None, new_floor_name: str | None = None
+    ) -> HassAreaCreated:
+        """
+        Make a new Home Assistant area (a room), on a floor or on a new floor.
+
+        Like Home Assistant's "Add area": a name and a floor; the rest of an area's fields
+        are set in Home Assistant. The speaker is put in it with set_player_area.
+
+        :param name: The name of the new area.
+        :param floor_id: The floor it is on, if any.
+        :param new_floor_name: The name of a new floor to make for it, instead.
+        :raises InvalidDataError: with a message an app can show as is, such as for a name
+            Home Assistant already has.
+        """
+        self._require_connected()
+        if not (name := name.strip()):
+            msg = "A room needs a name"
+            raise InvalidDataError(msg)
+        if floor_id is not None and new_floor_name is not None:
+            msg = "Pick a floor or name a new one, not both"
+            raise InvalidDataError(msg)
+        if floor_id is not None and floor_id not in await self.get_floor_registry():
+            msg = "That floor no longer exists in Home Assistant"
+            raise InvalidDataError(msg)
+        if new_floor_name is not None and not (new_floor_name := new_floor_name.strip()):
+            msg = "A floor needs a name"
+            raise InvalidDataError(msg)
+        try:
+            if new_floor_name is not None:
+                floor = await self.hass.send_command(
+                    "config/floor_registry/create", name=new_floor_name
+                )
+                floor_id = cast("str", floor["floor_id"])
+                await self.mass.cache.delete("_fetch_floor_registry", provider=self.instance_id)
+            fields: dict[str, Any] = {"name": name}
+            if floor_id is not None:
+                fields["floor_id"] = floor_id
+            area = await self.hass.send_command("config/area_registry/create", **fields)
+        except FailedCommand as err:
+            raise InvalidDataError(str(err) or "Home Assistant could not make the room") from err
+        await self.mass.cache.delete("_fetch_area_registry", provider=self.instance_id)
+        return {"area_id": cast("str", area["area_id"]), "floor_id": floor_id}
 
     async def get_states(
         self,
@@ -1587,6 +1760,10 @@ class HomeAssistantProvider(PluginProvider):
         for unregister_stereo in self._unregister_stereo_pair_commands or ():
             unregister_stereo()
         self._unregister_stereo_pair_commands = None
+        for unregister_area in self._unregister_area_commands or ():
+            unregister_area()
+        self._unregister_area_commands = None
+        self._area_devices = frozenset()
         for unsubscribe_registry in self._unsubscribe_location_registries or ():
             unsubscribe_registry()
         self._unsubscribe_location_registries = None
@@ -1732,6 +1909,7 @@ class HomeAssistantProvider(PluginProvider):
             self._entity_registry_generation += 1
             # an entity's area or labels may have changed
             self._speaker_list_changed()
+            self._schedule_area_sync()
         elif self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
             # the kept mirror rests on which fields Home Assistant reports, so leave a
             # trail that tells a stale entity listing apart from a lookup that never ran
@@ -1877,6 +2055,23 @@ class HomeAssistantProvider(PluginProvider):
                 IDENTIFY_SOUND_PATH, self._serve_identify_sound
             ),
         ]
+        self._unregister_area_commands = [
+            # any signed-in user may see the rooms, as the player locations
+            self.mass.register_api_command(
+                AREAS_COMMAND, self.get_areas, required_scope=Scope.PLAYERS_READ
+            ),
+            # places a player, a player setting that lives in Home Assistant
+            self.mass.register_api_command(
+                AREAS_SET_PLAYER_COMMAND,
+                self.set_player_area,
+                required_scope=Scope.CONFIG_PLAYERS_WRITE,
+            ),
+            self.mass.register_api_command(
+                AREAS_CREATE_COMMAND,
+                self.create_area,
+                required_scope=Scope.CONFIG_PLAYERS_WRITE,
+            ),
+        ]
         # follow the sync groups as they change, so a group that changes leader between
         # two requests for the locations still keeps its colour
         self._group_colours = GroupColours()
@@ -1899,9 +2094,14 @@ class HomeAssistantProvider(PluginProvider):
         if cache_key := LOCATION_REGISTRY_EVENTS.get(event["event_type"]):
             self.mass.create_task(self.mass.cache.delete(cache_key, provider=self.instance_id))
         self._speaker_list_changed()
+        if event["event_type"] in ("device_registry_updated", "area_registry_updated"):
+            self._schedule_area_sync()
 
     def _on_player_event(self, event: MassEvent) -> None:
         """Follow a change to the players, which may start, change or end a sync group."""
+        if event.event == EventType.PLAYER_ADDED:
+            # a new group takes its rooms' area, a returning player its kept one
+            self._schedule_area_sync()
         self._refresh_group_colours()
         self._match_starting_stereo_pairs()
         # most player updates (volume, position) leave the speaker list as it is
@@ -2124,6 +2324,150 @@ class HomeAssistantProvider(PluginProvider):
             msg = f"Group {group_id} did not let go of its rooms in time"
             raise PlayerCommandFailed(msg) from err
 
+    def _require_connected(self) -> None:
+        """Raise when Home Assistant is not connected."""
+        if not self.hass.connected:
+            msg = "Home Assistant is not connected"
+            raise ProviderUnavailableError(msg)
+
+    async def _player_devices(self) -> dict[str, _PlayerDevice]:
+        """Return the Home Assistant device of every player that has one, keyed by player ID."""
+        entity_registry, devices = await asyncio.gather(
+            self.get_entity_registry(), self.get_device_registry()
+        )
+        # as get_player_locations: only the Music Assistant integration's own media_player
+        entity_of_device = {
+            entry.device_id: (entity_id, entry)
+            for entity_id, entry in entity_registry.items()
+            if entry.platform == HASS_MUSIC_ASSISTANT_DOMAIN
+            and entry.device_id is not None
+            and entity_id.startswith("media_player.")
+        }
+        result: dict[str, _PlayerDevice] = {}
+        for device in devices.values():
+            for domain, identifier in device.get("identifiers") or ():
+                if domain != HASS_MUSIC_ASSISTANT_DOMAIN:
+                    continue
+                entity_id, entry = entity_of_device.get(device["id"], (None, None))
+                result[identifier] = _PlayerDevice(
+                    device_id=device["id"],
+                    area_id=device.get("area_id"),
+                    entity_id=entity_id,
+                    entity_area_id=entry.area_id if entry else None,
+                )
+        return result
+
+    def _area_copy(self, player_id: str) -> str | None:
+        """Return the area Music Assistant keeps for a player, or None if it keeps none."""
+        stored = self.mass.config.get_raw_player_config_value(player_id, CONF_PLAYER_AREA)
+        return stored if isinstance(stored, str) and stored else None
+
+    def _known_area(self, player_id: str, devices: Mapping[str, _PlayerDevice]) -> str | None:
+        """Return the area Home Assistant places a player in, or else the kept one."""
+        device = devices.get(player_id)
+        return (device.placed_in if device else None) or self._area_copy(player_id)
+
+    def _store_area_copy(self, player_id: str, area_id: str) -> None:
+        """
+        Keep a player's area ("" for deliberately none) in Music Assistant's settings.
+
+        :param player_id: The player to keep the area of.
+        :param area_id: The area ID, or "" for no area.
+        """
+        try:
+            self.mass.config.set_raw_player_config_value(player_id, CONF_PLAYER_AREA, area_id)
+        except KeyError:
+            # a player with no stored settings yet; the next sync keeps it
+            self.logger.debug("No settings to keep the area of %s in yet", player_id)
+
+    async def _write_device_area(self, device: _PlayerDevice, area_id: str | None) -> None:
+        """
+        Put a player's Home Assistant device in an area, as Home Assistant's own setting does.
+
+        :param device: The player's device.
+        :param area_id: The area, or None for none.
+        """
+        self._area_devices |= {device.device_id}
+        if device.area_id != area_id:
+            await self.hass.send_command(
+                "config/device_registry/update", device_id=device.device_id, area_id=area_id
+            )
+        if device.entity_id and device.entity_area_id and device.entity_area_id != area_id:
+            # the entity's own area would override the device's
+            await self.hass.send_command(
+                "config/entity_registry/update", entity_id=device.entity_id, area_id=None
+            )
+        await self.mass.cache.delete("_fetch_device_registry", provider=self.instance_id)
+
+    def _schedule_area_sync(self) -> None:
+        """Bring the kept areas in line once the current burst of changes is over."""
+        self.mass.call_later(
+            AREA_SYNC_DEBOUNCE,
+            self._sync_area_copies,
+            task_id=f"{self.instance_id}.area_sync",
+        )
+
+    async def _sync_area_copies(self) -> None:
+        """
+        Keep Music Assistant's copy of each player's area in line with Home Assistant.
+
+        Home Assistant leads for a player it has a device for: the copy follows its area,
+        so the player keeps its room when it is no longer exposed. A device seen for the
+        first time (a player just exposed, or the first look since connecting) without an
+        area takes the copy; one seen before that lost its area was taken out of it in Home
+        Assistant, so the copy is cleared too. A group never placed takes the area its rooms
+        share, if they share one.
+        """
+        if not self.hass.connected:
+            return
+        try:
+            devices = await self._player_devices()
+            areas = await self.get_area_registry()
+            for player in list(self.mass.players.iter_players()):
+                await self._sync_area_copy(player, devices, areas)
+        except (BaseHassClientError, MusicAssistantError) as err:
+            self.logger.warning("Could not bring the speakers' rooms in line: %s", err)
+
+    async def _sync_area_copy(
+        self,
+        player: Player,
+        devices: Mapping[str, _PlayerDevice],
+        areas: Mapping[str, Any],
+    ) -> None:
+        """
+        Bring one player's kept area in line with Home Assistant (see _sync_area_copies).
+
+        :param player: The player.
+        :param devices: The players' Home Assistant devices, keyed by player ID.
+        :param areas: The area registry, keyed by area ID.
+        """
+        player_id = player.player_id
+        stored = self.mass.config.get_raw_player_config_value(player_id, CONF_PLAYER_AREA)
+        device = devices.get(player_id)
+        first_sight = device is not None and device.device_id not in self._area_devices
+        if device is not None:
+            self._area_devices |= {device.device_id}
+            if (placed_in := device.placed_in) is not None:
+                if placed_in != stored:
+                    self._store_area_copy(player_id, placed_in)
+                    self._speaker_list_changed()
+                return
+        inherited = False
+        if stored is None and player.state.type == PlayerType.GROUP:
+            rooms = {self._known_area(room_id, devices) for room_id in self._group_rooms(player)}
+            if len(rooms) == 1 and (shared := rooms.pop()) is not None:
+                stored, inherited = shared, True
+                self._store_area_copy(player_id, shared)
+                self._speaker_list_changed()
+        if device is None or not isinstance(stored, str) or not stored:
+            return
+        if (first_sight or inherited) and stored in areas:
+            await self._write_device_area(device, stored)
+        elif not first_sight:
+            # Home Assistant took the player out of its area
+            self._store_area_copy(player_id, "")
+            self._speaker_list_changed()
+
 
 def _supports_image_generation(state: State) -> bool:
     """Return whether an ai_task entity state advertises image generation."""
@@ -2139,6 +2483,7 @@ def _player_location(
     areas: Mapping[str, Mapping[str, Any]],
     floors: Mapping[str, Mapping[str, Any]],
     labels: Mapping[str, Mapping[str, Any]],
+    area_copy: str | None = None,
 ) -> HassPlayerLocation:
     """
     Return the location of a player from its Home Assistant device and media_player entity.
@@ -2148,9 +2493,15 @@ def _player_location(
     :param areas: The area registry, keyed by area ID.
     :param floors: The floor registry, keyed by floor ID.
     :param labels: The label registry, keyed by label ID.
+    :param area_copy: The area Music Assistant keeps for the player, used when Home
+        Assistant places it nowhere.
     """
     # an area assigned to the entity overrides the one of its device
-    area_id = (entity.area_id if entity else None) or (device.get("area_id") if device else None)
+    area_id = (
+        (entity.area_id if entity else None)
+        or (device.get("area_id") if device else None)
+        or area_copy
+    )
     area = areas.get(area_id) if area_id else None
     floor_id = area.get("floor_id") if area else None
     floor = floors.get(floor_id) if floor_id else None

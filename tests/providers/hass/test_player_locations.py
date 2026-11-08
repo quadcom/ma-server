@@ -68,6 +68,7 @@ def _provider(
     connected: bool = True,
     config_values: dict[str, Any] | None = None,
     all_players: list[Any] | None = None,
+    area_copies: dict[str, Any] | None = None,
 ) -> HomeAssistantProvider:
     async def _send_command(command: str, **_kwargs: Any) -> Any:
         if command == "config/entity_registry/list_for_display":
@@ -100,9 +101,16 @@ def _provider(
     )
     # every player regardless of the user, from which the group colours are worked out
     players.iter_players = MagicMock(return_value=all_players or [])
+    copies = area_copies or {}
     provider.mass = SimpleNamespace(  # type: ignore[assignment]
         cache=_Cache(),
         players=players,
+        # Music Assistant's own copy of each player's area (hass_area_id)
+        config=SimpleNamespace(
+            get_raw_player_config_value=lambda player_id, _key, default=None: copies.get(
+                player_id, default
+            )
+        ),
         create_task=lambda coro, **_kwargs: asyncio.ensure_future(coro),
     )
     provider.logger = logging.getLogger("test.hass")
@@ -191,6 +199,39 @@ async def test_player_without_a_device_in_home_assistant() -> None:
         "floor_level": None,
         "labels": [],
     }
+
+
+async def test_player_not_exposed_takes_the_kept_area() -> None:
+    """Place a player Home Assistant has no device for in the area Music Assistant keeps."""
+    provider = _provider(["player1"], [], [], area_copies={"player1": "office"})
+
+    location = (await provider.get_player_locations())["players"]["player1"]
+
+    assert (location["area"], location["floor"]) == ("Office", "Upstairs")
+
+
+async def test_area_in_home_assistant_wins_over_the_kept_one() -> None:
+    """Prefer where Home Assistant places a player over Music Assistant's copy."""
+    provider = _provider(
+        ["player1"],
+        [_device("dev1", "player1", area_id="kitchen")],
+        [_entity("media_player.kitchen", "dev1")],
+        area_copies={"player1": "office"},
+    )
+
+    location = (await provider.get_player_locations())["players"]["player1"]
+
+    assert location["area"] == "Kitchen"
+
+
+@pytest.mark.parametrize("kept", ["", "deleted_area"])
+async def test_no_kept_area_or_a_deleted_one_places_nowhere(kept: str) -> None:
+    """Place nowhere a player kept in no area, or in an area Home Assistant no longer has."""
+    provider = _provider(["player1"], [], [], area_copies={"player1": kept})
+
+    location = (await provider.get_player_locations())["players"]["player1"]
+
+    assert location["area"] is None
 
 
 async def test_labels_of_entity_and_device_are_merged_and_sorted() -> None:

@@ -30,6 +30,9 @@ from music_assistant.constants import CONF_LOG_LEVEL, CONF_VERIFY_SSL
 from music_assistant.helpers.api import APICommandHandler
 from music_assistant.helpers.tts import TTSLanguageNotSupportedError
 from music_assistant.providers.hass import (
+    AREAS_COMMAND,
+    AREAS_CREATE_COMMAND,
+    AREAS_SET_PLAYER_COMMAND,
     CONF_AUTH_TOKEN,
     CONF_URL,
     PLAYER_LOCATIONS_COMMAND,
@@ -39,6 +42,8 @@ from music_assistant.providers.hass import (
     STEREO_PAIR_CREATE_COMMAND,
     STEREO_PAIR_IDENTIFY_COMMAND,
     STEREO_PAIR_SET_COMMAND,
+    HassAreaCreated,
+    HassAreas,
     HassPlayerLocations,
     HassRegistryEntity,
     HomeAssistantProvider,
@@ -1824,7 +1829,10 @@ async def test_location_registries_are_watched_for_the_speaker_list() -> None:
             await asyncio.sleep(0)
 
         delete.assert_awaited_once_with("_fetch_area_registry", provider=provider.instance_id)
-        assert mass.call_later.call_args[0][1] == provider._signal_speaker_list
+        scheduled = [call[0][1] for call in mass.call_later.call_args_list]
+        assert provider._signal_speaker_list in scheduled
+        # an area change may leave a kept area pointing nowhere
+        assert provider._sync_area_copies in scheduled
 
 
 async def test_config_entries_do_not_read_home_assistant() -> None:
@@ -2225,6 +2233,9 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
     unregister_identify = MagicMock()
     unregister_set_stereo = MagicMock()
     unregister_create_stereo = MagicMock()
+    unregister_areas = MagicMock()
+    unregister_set_area = MagicMock()
+    unregister_create_area = MagicMock()
     mass.register_api_command = MagicMock(
         side_effect=[
             unregister_search,
@@ -2234,6 +2245,9 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
             unregister_identify,
             unregister_set_stereo,
             unregister_create_stereo,
+            unregister_areas,
+            unregister_set_area,
+            unregister_create_area,
         ]
     )
     manifest = MagicMock()
@@ -2252,6 +2266,48 @@ async def test_init_cancelled_during_connect_unregisters_search_command() -> Non
     unregister_identify.assert_called_once()
     unregister_set_stereo.assert_called_once()
     unregister_create_stereo.assert_called_once()
+    unregister_areas.assert_called_once()
+    unregister_set_area.assert_called_once()
+    unregister_create_area.assert_called_once()
+
+
+async def test_area_commands_are_registered() -> None:
+    """Register the room picker's commands, with the rights each one needs."""
+    mass = _mass()
+    mass.register_api_command = MagicMock(return_value=MagicMock())
+    manifest = MagicMock()
+    manifest.domain = "hass"
+    manifest.name = "Home Assistant"
+    with patch(
+        "music_assistant.providers.hass.HomeAssistantClient",
+        return_value=_HomeAssistantClient([]),
+    ):
+        provider = await setup(mass, manifest, _config())
+        assert isinstance(provider, HomeAssistantProvider)
+        async with asyncio.timeout(5):
+            await provider.handle_async_init()
+
+    # the room picker: anyone may see the rooms, placing a speaker is a player setting
+    mass.register_api_command.assert_any_call(
+        AREAS_COMMAND, provider.get_areas, required_scope=Scope.PLAYERS_READ
+    )
+    handler = APICommandHandler.parse(AREAS_COMMAND, provider.get_areas)
+    assert handler.type_hints["return"] is HassAreas
+    mass.register_api_command.assert_any_call(
+        AREAS_SET_PLAYER_COMMAND,
+        provider.set_player_area,
+        required_scope=Scope.CONFIG_PLAYERS_WRITE,
+    )
+    APICommandHandler.parse(AREAS_SET_PLAYER_COMMAND, provider.set_player_area)
+    mass.register_api_command.assert_any_call(
+        AREAS_CREATE_COMMAND,
+        provider.create_area,
+        required_scope=Scope.CONFIG_PLAYERS_WRITE,
+    )
+    handler = APICommandHandler.parse(AREAS_CREATE_COMMAND, provider.create_area)
+    assert handler.type_hints["return"] is HassAreaCreated
+
+    await provider.unload()
 
 
 async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> None:
@@ -2264,6 +2320,9 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
     unregister_identify = MagicMock()
     unregister_set_stereo = MagicMock()
     unregister_create_stereo = MagicMock()
+    unregister_areas = MagicMock()
+    unregister_set_area = MagicMock()
+    unregister_create_area = MagicMock()
     mass.register_api_command = MagicMock(
         side_effect=[
             unregister_search,
@@ -2273,6 +2332,9 @@ async def test_player_locations_command_is_exposed_to_every_signed_in_user() -> 
             unregister_identify,
             unregister_set_stereo,
             unregister_create_stereo,
+            unregister_areas,
+            unregister_set_area,
+            unregister_create_area,
         ]
     )
     manifest = MagicMock()
