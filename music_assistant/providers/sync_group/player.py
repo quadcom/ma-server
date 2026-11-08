@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.constants import PLAYER_CONTROL_FAKE
 from music_assistant_models.enums import ConfigEntryType, PlaybackState, PlayerFeature, PlayerType
-from music_assistant_models.errors import PlayerCommandFailed, UnsupportedFeaturedException
+from music_assistant_models.errors import PlayerCommandFailed
 from propcache import under_cached_property as cached_property
 
 from music_assistant.constants import (
@@ -123,10 +123,11 @@ class SyncGroupPlayer(Player):
             # In dynamic mode the configured members act as a preset: they are
             # pulled in when the group is powered on
             self._attr_static_group_members = []
-            self._attr_supported_features.add(PlayerFeature.SET_MEMBERS)
         else:
+            # A fixed group always holds its configured members; it can take in
+            # extra players for a session, which are let go when the session ends
             self._attr_static_group_members = list(preset_members)
-            self._attr_supported_features.discard(PlayerFeature.SET_MEMBERS)
+        self._attr_supported_features.add(PlayerFeature.SET_MEMBERS)
         # Only realign the effective member list to the preset when we are
         # dormant. Otherwise a config save (e.g. user toggling an unrelated
         # field) would wipe any dynamic joins that happened during this session.
@@ -152,8 +153,8 @@ class SyncGroupPlayer(Player):
         )
         if raw_power_conf == PLAYER_CONTROL_FAKE:
             base_features.add(PlayerFeature.POWER)
-        if self.is_dynamic:
-            base_features.add(PlayerFeature.SET_MEMBERS)
+        # a fixed group takes extra players too (its own members stay)
+        base_features.add(PlayerFeature.SET_MEMBERS)
         if self.sync_leader:
             # playback capabilities (enqueue, gapless, DSP) and the transport of a source
             # the leader plays itself stay bound to the sync leader: those commands are
@@ -237,10 +238,8 @@ class SyncGroupPlayer(Player):
     @property
     def can_group_with(self) -> set[str]:
         """Return the id's of players this player can group with."""
-        if not self.is_dynamic:
-            # in case of static members,
-            # we can only group with the players defined in the config, so we return those directly
-            return set(self._attr_static_group_members)
+        # A fixed group can take in extra players as well, so both kinds offer what their
+        # members can group with.
         # Aggregate can_group_with from ALL current group members (not just the leader).
         # A sync group can accommodate protocol switches, so a player compatible with
         # ANY current member is a valid candidate to join.
@@ -407,6 +406,7 @@ class SyncGroupPlayer(Player):
         else:
             # dissolve syncgroup when powering off
             await self._dissolve_syncgroup()
+            self._release_extra_members()
 
         if self._attr_powered != powered:
             self._attr_powered = powered
@@ -440,6 +440,7 @@ class SyncGroupPlayer(Player):
         if self._attr_powered is True:
             return
         await self._dissolve_syncgroup()
+        self._release_extra_members()
 
     async def play(self) -> None:
         """Send PLAY (unpause) command to given player."""
@@ -572,14 +573,13 @@ class SyncGroupPlayer(Player):
         player_ids_to_add: list[str] | None = None,
         player_ids_to_remove: list[str] | None = None,
     ) -> None:
-        """Handle SET_MEMBERS command on the player."""
-        if not self.is_dynamic:
-            raise UnsupportedFeaturedException(
-                f"Group {self.display_name} does not allow dynamically adding/removing members!",
-                translation_key="not_dynamic",
-                translation_owner=self.translation_owner,
-                translation_args=[self.display_name],
-            )
+        """
+        Handle SET_MEMBERS command on the player.
+
+        A dynamic group takes in and lets go of any member. A fixed group takes in extra
+        players for the session, but its configured (static) members stay: removing one
+        is refused, as they only change in the group's settings.
+        """
         sync_leader = self.sync_leader or self._select_sync_leader(new_members=player_ids_to_add)
         # A start that was just issued to the leader may not be reflected in the
         # (transient) device state yet, so treat the startup window as playing —
@@ -659,7 +659,10 @@ class SyncGroupPlayer(Player):
                 # static members can not be removed from the group
                 raise PlayerCommandFailed(
                     f"Cannot remove {member_id} from group {self.display_name} "
-                    "since it's a static member!"
+                    "since it's a static member!",
+                    translation_key="static_member",
+                    translation_owner=self.translation_owner,
+                    translation_args=[member_id, self.display_name],
                 )
             if self.sync_leader and member_id == self.sync_leader.player_id:
                 leader_removed = True
@@ -1589,11 +1592,20 @@ class SyncGroupPlayer(Player):
                 self.display_name,
             )
             await self._dissolve_syncgroup()
+            self._release_extra_members()
 
     @property
     def _playback_recently_started(self) -> bool:
         """Return whether a playback start was issued within the settle window."""
         return (time.monotonic() - self._playback_start_at) < PLAYBACK_START_TIMEOUT
+
+    def _release_extra_members(self) -> None:
+        """Let a fixed group's extra players go once its session ended: back to its own."""
+        if self.is_dynamic or self._attr_group_members == self._attr_static_group_members:
+            return
+        self._attr_group_members = list(self._attr_static_group_members)
+        self._update_attributes()
+        self.update_state()
 
     def _schedule_rejoin_missing_members(self) -> None:
         """Debounce a re-add of the configured members the live leader is not holding."""
