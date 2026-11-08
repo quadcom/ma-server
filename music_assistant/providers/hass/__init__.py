@@ -953,8 +953,10 @@ class HomeAssistantProvider(PluginProvider):
 
         The left speaker plays only the left side and the other only the right. Both play
         over their own Sendspin output, which builds each speaker's audio itself: grouped
-        the speaker's own way (such as Sonos's), both would play one shared stream. The
-        pair stays a permanent group, so it still joins and leads other groups as one room.
+        the speaker's own way (such as Sonos's), both would play one shared stream. Both are
+        set to the quieter one's volume; the group's volume then keeps them equal, as it
+        scales each speaker from where it is. The pair stays a permanent group, so it still
+        joins and leads other groups as one room.
 
         :param group_id: The permanent group of exactly two speakers.
         :param left_player_id: The speaker on the left, or None to turn the pair off and
@@ -983,6 +985,7 @@ class HomeAssistantProvider(PluginProvider):
             for room_id, room in players.items():
                 side = "left" if room_id == left_player_id else "right"
                 await self._set_room_side(room_id, room, side, outputs[room_id])
+            await self._match_pair_volume(players)
         self._speaker_list_changed()
 
     async def get_states(
@@ -1951,6 +1954,27 @@ class HomeAssistantProvider(PluginProvider):
             await self.mass.config.save_player_config(
                 output.output_protocol_id, {CONF_OUTPUT_CHANNELS: side}
             )
+
+    async def _match_pair_volume(self, rooms: Mapping[str, Player | None]) -> None:
+        """
+        Set both speakers of a stereo pair to the quieter one's volume.
+
+        The quieter one, so that neither gets suddenly loud. Left as it is when a
+        speaker reports no volume.
+
+        :param rooms: The pair's speakers, keyed by ID.
+        """
+        levels = {
+            room_id: room.state.volume_level
+            for room_id, room in rooms.items()
+            if room is not None and room.state.volume_level is not None
+        }
+        if len(levels) != len(rooms):
+            return
+        target = min(levels.values())
+        for room_id, level in levels.items():
+            if level != target:
+                await self.mass.players.cmd_volume_set(room_id, target)
 
     async def _serve_identify_sound(self, request: web.Request) -> web.FileResponse:
         """Serve the sound a speaker plays to tell the user which one it is."""

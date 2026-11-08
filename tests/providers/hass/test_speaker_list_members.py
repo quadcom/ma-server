@@ -26,6 +26,7 @@ def _player(player_id: str, player_type: PlayerType = PlayerType.PLAYER, **state
         "synced_to": None,
         "group_members": [],
         "static_group_members": [],
+        "volume_level": None,
     }
     outputs = state.pop("outputs", [])
     fields.update(state)
@@ -42,11 +43,11 @@ def _output(output_id: str, domain: str, *, native: bool = False, available: boo
     )
 
 
-def _sonos(player_id: str, *, sendspin: bool = True) -> Any:
+def _sonos(player_id: str, *, sendspin: bool = True, volume: int | None = None) -> Any:
     outputs = [_output("native", "sonos", native=True), _output(f"ap_{player_id}", "airplay")]
     if sendspin:
         outputs.append(_output(f"spb_{player_id}", "sendspin"))
-    return _player(player_id, outputs=outputs)
+    return _player(player_id, outputs=outputs, volume_level=volume)
 
 
 def _provider(players: list[Any], configured: dict[str, list[str]] | None = None) -> Any:
@@ -56,6 +57,7 @@ def _provider(players: list[Any], configured: dict[str, list[str]] | None = None
     mass_players.get_player = MagicMock(side_effect=by_id.get)
     mass_players.cmd_set_members = AsyncMock()
     mass_players.cmd_ungroup = AsyncMock()
+    mass_players.cmd_volume_set = AsyncMock()
     config = MagicMock()
     config.save_player_config = AsyncMock()
     config.get_raw_player_config_value = MagicMock(
@@ -263,3 +265,33 @@ async def test_identify_needs_an_available_speaker() -> None:
         with pytest.raises(PlayerCommandFailed):
             await provider.identify_stereo_speaker(player_id)
     provider.mass.create_task.assert_not_called()
+
+
+async def test_a_stereo_pair_plays_at_the_quieter_speakers_volume() -> None:
+    """Bring the louder speaker down to the quieter one's volume when pairing."""
+    players = [
+        _player("bedroom", PlayerType.GROUP),
+        _sonos("bed1", volume=10),
+        _sonos("bed2", volume=62),
+    ]
+    provider = _provider(players, {"bedroom": ["bed1", "bed2"]})
+
+    await provider.set_stereo_pair("bedroom", "bed1")
+
+    provider.mass.players.cmd_volume_set.assert_awaited_once_with("bed2", 10)
+
+
+async def test_volumes_are_left_alone_when_unknown_or_turning_off() -> None:
+    """Leave the volumes when a speaker reports none, and when the pair is turned off."""
+    players = [
+        _player("bedroom", PlayerType.GROUP),
+        _sonos("bed1", volume=10),
+        _sonos("bed2"),
+    ]
+    provider = _provider(players, {"bedroom": ["bed1", "bed2"]})
+
+    await provider.set_stereo_pair("bedroom", "bed1")
+    players[2].state.volume_level = 62
+    await provider.set_stereo_pair("bedroom", None)
+
+    provider.mass.players.cmd_volume_set.assert_not_awaited()
