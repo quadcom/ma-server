@@ -8,7 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from music_assistant_models.enums import PlayerType
+from music_assistant_models.enums import PlaybackState, PlayerType
 from music_assistant_models.errors import InvalidDataError, PlayerCommandFailed
 
 from music_assistant.constants import (
@@ -27,6 +27,7 @@ def _player(player_id: str, player_type: PlayerType = PlayerType.PLAYER, **state
         "group_members": [],
         "static_group_members": [],
         "volume_level": None,
+        "playback_state": PlaybackState.IDLE,
     }
     outputs = state.pop("outputs", [])
     fields.update(state)
@@ -50,19 +51,28 @@ def _sonos(player_id: str, *, sendspin: bool = True, volume: int | None = None) 
     return _player(player_id, outputs=outputs, volume_level=volume)
 
 
-def _provider(players: list[Any], configured: dict[str, list[str]] | None = None) -> Any:
+def _provider(
+    players: list[Any],
+    configured: dict[str, list[str]] | None = None,
+    sides: dict[str, str] | None = None,
+) -> Any:
     by_id = {player.player_id: player for player in players}
     provider = HomeAssistantProvider.__new__(HomeAssistantProvider)
     mass_players = MagicMock()
     mass_players.get_player = MagicMock(side_effect=by_id.get)
+    mass_players.iter_players = MagicMock(side_effect=lambda: list(players))
     mass_players.cmd_set_members = AsyncMock()
     mass_players.cmd_ungroup = AsyncMock()
     mass_players.cmd_volume_set = AsyncMock()
     config = MagicMock()
     config.save_player_config = AsyncMock()
+    settings: dict[str, dict[str, Any]] = {
+        CONF_GROUP_MEMBERS: configured or {},
+        CONF_OUTPUT_CHANNELS: sides or {},
+    }
     config.get_raw_player_config_value = MagicMock(
-        side_effect=lambda player_id, key, default=None: (
-            (configured or {}).get(player_id, default) if key == CONF_GROUP_MEMBERS else default
+        side_effect=lambda player_id, key, default=None: settings.get(key, {}).get(
+            player_id, default
         )
     )
     provider.mass = SimpleNamespace(  # type: ignore[assignment]
@@ -295,3 +305,49 @@ async def test_volumes_are_left_alone_when_unknown_or_turning_off() -> None:
     await provider.set_stereo_pair("bedroom", None)
 
     provider.mass.players.cmd_volume_set.assert_not_awaited()
+
+
+async def test_a_stereo_pair_matches_its_volumes_each_time_it_starts() -> None:
+    """Match a pair's volumes when it starts playing, not while it plays on."""
+    players = [
+        _player("bedroom", PlayerType.GROUP),
+        _sonos("bed1", volume=30),
+        _sonos("bed2", volume=40),
+    ]
+    provider = _provider(
+        players, {"bedroom": ["bed1", "bed2"]}, sides={"bed1": "left", "bed2": "right"}
+    )
+    started: list[Any] = []
+    provider.mass.create_task = MagicMock(side_effect=started.append)
+
+    async def _events(*states: PlaybackState) -> None:
+        for playback_state in states:
+            players[0].state.playback_state = playback_state
+            provider._match_starting_stereo_pairs()
+        for coro in started:
+            await coro
+        started.clear()
+
+    await _events(PlaybackState.PLAYING, PlaybackState.PLAYING)
+    provider.mass.players.cmd_volume_set.assert_awaited_once_with("bed2", 30)
+
+    provider.mass.players.cmd_volume_set.reset_mock()
+    await _events(PlaybackState.PLAYING)
+    provider.mass.players.cmd_volume_set.assert_not_awaited()
+
+    await _events(PlaybackState.IDLE, PlaybackState.PLAYING)
+    provider.mass.players.cmd_volume_set.assert_awaited_once_with("bed2", 30)
+
+
+async def test_a_group_that_is_no_stereo_pair_keeps_its_volumes() -> None:
+    """Leave the volumes of a group whose speakers both play stereo."""
+    players = [
+        _player("bedroom", PlayerType.GROUP, playback_state=PlaybackState.PLAYING),
+        _sonos("bed1", volume=30),
+        _sonos("bed2", volume=40),
+    ]
+    provider = _provider(players, {"bedroom": ["bed1", "bed2"]})
+
+    provider._match_starting_stereo_pairs()
+
+    provider.mass.create_task.assert_not_called()

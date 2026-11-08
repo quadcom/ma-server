@@ -38,6 +38,7 @@ from music_assistant_models.enums import (
     ContentType,
     EventType,
     MediaType,
+    PlaybackState,
     PlayerType,
     ProviderFeature,
     StreamType,
@@ -90,7 +91,12 @@ from .control_entities import (
 )
 from .group_colours import GroupColours, groups_from_players
 from .helpers import ControlCapabilities, get_control_name, is_entity_id
-from .speaker_list import SpeakerList, build_speaker_list, permanent_group_rooms
+from .speaker_list import (
+    SpeakerList,
+    build_speaker_list,
+    permanent_group_rooms,
+    stereo_pair_left,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping
@@ -298,6 +304,8 @@ class HomeAssistantProvider(PluginProvider):
     _unregister_speaker_list_command: Callable[[], None] | None = None
     _unregister_speaker_list_members_command: Callable[[], None] | None = None
     _unregister_stereo_pair_commands: list[Callable[[], None]] | None = None
+    # the stereo pairs playing when the players last changed, to match their volumes on a start
+    _playing_stereo_pairs: frozenset[str] = frozenset()
     _unsubscribe_location_registries: list[Callable[[], None]] | None = None
     # bumped (and announced) whenever the speaker list may look different
     _speaker_list_revision: int = 0
@@ -1841,6 +1849,7 @@ class HomeAssistantProvider(PluginProvider):
     def _on_player_event(self, event: MassEvent) -> None:
         """Follow a change to the players, which may start, change or end a sync group."""
         self._refresh_group_colours()
+        self._match_starting_stereo_pairs()
         # most player updates (volume, position) leave the speaker list as it is
         players = frozenset(
             (
@@ -1960,7 +1969,9 @@ class HomeAssistantProvider(PluginProvider):
         Set both speakers of a stereo pair to the quieter one's volume.
 
         The quieter one, so that neither gets suddenly loud. Left as it is when a
-        speaker reports no volume.
+        speaker reports no volume. Done when the pair is set up and each time it starts
+        playing, so a change made to one speaker on its own (such as in the Sonos app)
+        doesn't leave one side louder.
 
         :param rooms: The pair's speakers, keyed by ID.
         """
@@ -1975,6 +1986,26 @@ class HomeAssistantProvider(PluginProvider):
         for room_id, level in levels.items():
             if level != target:
                 await self.mass.players.cmd_volume_set(room_id, target)
+
+    def _match_starting_stereo_pairs(self) -> None:
+        """Match the volumes of each stereo pair that has just started playing."""
+        playing: set[str] = set()
+        for player in self.mass.players.iter_players():
+            if (
+                player.state.type != PlayerType.GROUP
+                or player.state.playback_state != PlaybackState.PLAYING
+            ):
+                continue
+            rooms = self._group_rooms(player)
+            if stereo_pair_left(rooms, {room_id: self._room_side(room_id) for room_id in rooms}):
+                playing.add(player.player_id)
+                if player.player_id not in self._playing_stereo_pairs:
+                    self.mass.create_task(
+                        self._match_pair_volume(
+                            {room_id: self.mass.players.get_player(room_id) for room_id in rooms}
+                        )
+                    )
+        self._playing_stereo_pairs = frozenset(playing)
 
     async def _serve_identify_sound(self, request: web.Request) -> web.FileResponse:
         """Serve the sound a speaker plays to tell the user which one it is."""
