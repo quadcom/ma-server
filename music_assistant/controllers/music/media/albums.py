@@ -447,6 +447,33 @@ class AlbumsController(MediaControllerBase[Album]):
         # delete entry(s) from album artists table
         await self.mass.music.database.delete(DB_TABLE_ALBUM_ARTISTS, {"album_id": db_id})
 
+    async def remove_unmapped_item(self, item_id: str | int, provider_instance_id: str) -> None:
+        """
+        Delete an album whose last provider mapping went away with a provider.
+
+        Its tracks that another provider still has are kept and only lose the link to this
+        album; the next sync of their provider files them under its own album again.
+
+        :param item_id: The library item id of the album.
+        :param provider_instance_id: The provider instance whose mappings were removed.
+        """
+        db_id = int(item_id)  # ensure integer
+        tracks = self.mass.music.tracks
+        for db_row in await self.mass.music.database.get_rows_from_query(
+            f"SELECT track_id FROM {DB_TABLE_ALBUM_TRACKS} WHERE album_id = :album_id",
+            {"album_id": db_id},
+            limit=0,
+        ):
+            track_id = int(db_row["track_id"])
+            if await tracks.has_mapping_outside(track_id, provider_instance_id):
+                await self.mass.music.database.delete(
+                    DB_TABLE_ALBUM_TRACKS, {"album_id": db_id, "track_id": track_id}
+                )
+                continue
+            with contextlib.suppress(MediaNotFoundError):
+                await tracks.remove_item_from_library(track_id)
+        await self.remove_item_from_library(db_id)
+
     async def set_release_group(
         self,
         album_item_id: int,

@@ -1761,7 +1761,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             # clears its provider mapping rows. Dropping those rows up front would leave
             # the item behind without any mappings if the removal itself fails.
             with suppress(MediaNotFoundError):
-                await self.remove_item_from_library(db_id)
+                await self.remove_unmapped_item(db_id, provider_instance_id)
             return
 
         await self._delete_removed_mapping_analysis(
@@ -1842,7 +1842,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             # clears its provider mapping rows. Dropping those rows up front would leave
             # the item behind without any mappings if the removal itself fails.
             with suppress(MediaNotFoundError):
-                await self.remove_item_from_library(db_id)
+                await self.remove_unmapped_item(db_id, provider_instance_id)
             return
 
         await self._delete_removed_mapping_analysis(
@@ -1877,6 +1877,37 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         if not SUPPRESS_MEDIA_ITEM_UPDATES.get():
             event_item = await self.get_library_item(db_id) if images_changed else library_item
             self.mass.signal_event(EventType.MEDIA_ITEM_UPDATED, event_item.uri, event_item)
+
+    async def remove_unmapped_item(self, item_id: str | int, provider_instance_id: str) -> None:
+        """
+        Delete a library item whose last provider mapping went away with a provider.
+
+        Override in a subclass to keep related items that another provider still has.
+
+        :param item_id: The library item id.
+        :param provider_instance_id: The provider instance whose mappings were removed.
+        """
+        await self.remove_item_from_library(item_id)
+
+    @final
+    async def has_mapping_outside(self, item_id: str | int, provider_instance_id: str) -> bool:
+        """
+        Return whether a library item is mapped to a provider instance other than the given one.
+
+        :param item_id: The library item id.
+        :param provider_instance_id: The provider instance to leave out.
+        """
+        query = (
+            f"SELECT item_id FROM {DB_TABLE_PROVIDER_MAPPINGS} "
+            "WHERE media_type = :media_type AND item_id = :item_id "
+            "AND provider_instance != :provider_instance"
+        )
+        params = {
+            "media_type": self.media_type.value,
+            "item_id": int(item_id),
+            "provider_instance": provider_instance_id,
+        }
+        return await self.mass.music.database.get_count_from_query(query, params) > 0
 
     @final
     async def remove_missing_provider_mappings(

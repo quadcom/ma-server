@@ -541,3 +541,126 @@ async def test_database_cleanup_removes_relations_of_deleted_items(mass: MusicAs
         DB_TABLE_ALBUM_ARTISTS,
         {"album_id": int(album.item_id), "artist_id": int(artist.item_id)},
     )
+
+
+def _mapping(item_id: str, instance: str) -> ProviderMapping:
+    """Build a provider mapping for one of the two test providers."""
+    domain = "filesystem_local" if instance == FS_INSTANCE else "spotify"
+    return ProviderMapping(item_id=item_id, provider_domain=domain, provider_instance=instance)
+
+
+async def test_cleanup_keeps_track_with_other_provider_under_removed_album(
+    mass: MusicAssistant,
+) -> None:
+    """A track another provider still has survives the removal of its album and artist."""
+    artist = await mass.music.artists.add_item_to_library(
+        Artist(
+            item_id="gone-artist",
+            provider=FS_INSTANCE,
+            name="Gone Artist",
+            provider_mappings={_mapping("gone-artist", FS_INSTANCE)},
+        )
+    )
+    album = await mass.music.albums.add_item_to_library(
+        Album(
+            item_id="gone-album",
+            provider=FS_INSTANCE,
+            name="Gone Album",
+            artists=UniqueList([artist]),
+            provider_mappings={_mapping("gone-album", FS_INSTANCE)},
+        )
+    )
+    track = await mass.music.tracks.add_item_to_library(
+        Track(
+            item_id="kept-track",
+            provider=FS_INSTANCE,
+            name="Kept Track",
+            artists=UniqueList([artist]),
+            album=album,
+            provider_mappings={
+                _mapping("kept-track", FS_INSTANCE),
+                _mapping("sp-kept-track", STREAM_INSTANCE),
+            },
+        )
+    )
+    track_id = int(track.item_id)
+    # a track only the removed provider has goes with its album, as before
+    gone_track = await mass.music.tracks.add_item_to_library(
+        Track(
+            item_id="gone-track",
+            provider=FS_INSTANCE,
+            name="Gone Track",
+            artists=UniqueList([artist]),
+            album=album,
+            provider_mappings={_mapping("gone-track", FS_INSTANCE)},
+        )
+    )
+
+    await mass.music.cleanup_provider(FS_INSTANCE)
+
+    with pytest.raises(MediaNotFoundError):
+        await mass.music.tracks.get_library_item(int(gone_track.item_id))
+    # the album and artist only the removed provider had are gone
+    with pytest.raises(MediaNotFoundError):
+        await mass.music.albums.get_library_item(int(album.item_id))
+    with pytest.raises(MediaNotFoundError):
+        await mass.music.artists.get_library_item(int(artist.item_id))
+    # the track is still in the library, on the provider that has it
+    kept = await mass.music.tracks.get_library_item(track_id)
+    assert {pm.provider_instance for pm in kept.provider_mappings} == {STREAM_INSTANCE}
+
+
+async def test_cleanup_keeps_album_with_other_provider_under_removed_artist(
+    mass: MusicAssistant,
+) -> None:
+    """An album and its track another provider still has survive the removal of their artist."""
+    artist = await mass.music.artists.add_item_to_library(
+        Artist(
+            item_id="gone-artist-2",
+            provider=FS_INSTANCE,
+            name="Gone Artist Two",
+            provider_mappings={_mapping("gone-artist-2", FS_INSTANCE)},
+        )
+    )
+    album = await mass.music.albums.add_item_to_library(
+        Album(
+            item_id="kept-album",
+            provider=FS_INSTANCE,
+            name="Kept Album",
+            artists=UniqueList([artist]),
+            provider_mappings={
+                _mapping("kept-album", FS_INSTANCE),
+                _mapping("sp-kept-album", STREAM_INSTANCE),
+            },
+        )
+    )
+    track = await mass.music.tracks.add_item_to_library(
+        Track(
+            item_id="kept-track-2",
+            provider=FS_INSTANCE,
+            name="Kept Track Two",
+            artists=UniqueList([artist]),
+            album=album,
+            provider_mappings={
+                _mapping("kept-track-2", FS_INSTANCE),
+                _mapping("sp-kept-track-2", STREAM_INSTANCE),
+            },
+        )
+    )
+
+    await mass.music.cleanup_provider(FS_INSTANCE)
+
+    with pytest.raises(MediaNotFoundError):
+        await mass.music.artists.get_library_item(int(artist.item_id))
+    kept_album = await mass.music.albums.get_library_item(int(album.item_id))
+    assert {pm.provider_instance for pm in kept_album.provider_mappings} == {STREAM_INSTANCE}
+    kept_track = await mass.music.tracks.get_library_item(int(track.item_id))
+    assert {pm.provider_instance for pm in kept_track.provider_mappings} == {STREAM_INSTANCE}
+    # the album keeps its track; only the link to the removed artist is gone
+    assert await mass.music.database.get_rows(
+        DB_TABLE_ALBUM_TRACKS,
+        {"album_id": int(album.item_id), "track_id": int(track.item_id)},
+    )
+    assert not await mass.music.database.get_rows(
+        DB_TABLE_ALBUM_ARTISTS, {"artist_id": int(artist.item_id)}
+    )
