@@ -46,6 +46,7 @@ from .const import (
     ITEM_KEY_MEDIA_STREAMS,
     ITEM_KEY_MUSICBRAINZ_ALBUM,
     ITEM_KEY_MUSICBRAINZ_ARTIST,
+    ITEM_KEY_MUSICBRAINZ_RECORDING,
     ITEM_KEY_MUSICBRAINZ_RELEASE_GROUP,
     ITEM_KEY_MUSICBRAINZ_TRACK,
     ITEM_KEY_NAME,
@@ -276,16 +277,7 @@ def parse_track(
         track.duration = int(
             jellyfin_track[ITEM_KEY_RUNTIME_TICKS] / 10000000
         )  # 10000000 ticks per second
-    if ITEM_KEY_MUSICBRAINZ_TRACK in jellyfin_track[ITEM_KEY_PROVIDER_IDS]:
-        track_mbid = jellyfin_track[ITEM_KEY_PROVIDER_IDS][ITEM_KEY_MUSICBRAINZ_TRACK]
-        try:
-            track.mbid = track_mbid
-        except InvalidDataError as error:
-            logger.warning(
-                "Jellyfin has an invalid musicbrainz id for track %s",
-                track.name,
-                exc_info=error if logger.isEnabledFor(logging.DEBUG) else None,
-            )
+    _parse_track_mbids(logger, track, jellyfin_track[ITEM_KEY_PROVIDER_IDS])
     user_data = jellyfin_track.get(ITEM_KEY_USER_DATA, {})
     track.favorite = True if user_data.get(USER_DATA_KEY_IS_FAVORITE) else None
     return track
@@ -397,3 +389,37 @@ def _gain_to_loudness(value: object) -> float | None:
         return None
     # Jellyfin's gain targets the ReplayGain 2.0 reference level of -18 LUFS
     return -18.0 - float(value)
+
+
+def _parse_track_mbids(logger: Logger, track: Track, provider_ids: dict[str, str]) -> None:
+    """
+    Add the MusicBrainz recording and release track ids of a Jellyfin track.
+
+    Jellyfin reports the recording as MusicBrainzRecording and keeps the release track id
+    in MusicBrainzTrack. Taking the release track id for the recording made a Jellyfin
+    track look like a different recording than the same track from any other provider.
+
+    :param logger: Logger for invalid ids.
+    :param track: The track being parsed.
+    :param provider_ids: The track's Jellyfin ProviderIds.
+    """
+    recording_id = provider_ids.get(ITEM_KEY_MUSICBRAINZ_RECORDING)
+    track_id = provider_ids.get(ITEM_KEY_MUSICBRAINZ_TRACK)
+    if not recording_id:
+        # without a recording id, MusicBrainzTrack is all there is to go on, as before
+        recording_id, track_id = track_id, None
+    for external_id_type, value in (
+        (ExternalID.MB_RECORDING, recording_id),
+        (ExternalID.MB_TRACK, track_id),
+    ):
+        if not value:
+            continue
+        try:
+            track.add_external_id(external_id_type, value)
+        except InvalidDataError as error:
+            logger.warning(
+                "Jellyfin has an invalid %s for track %s",
+                external_id_type.value,
+                track.name,
+                exc_info=error if logger.isEnabledFor(logging.DEBUG) else None,
+            )

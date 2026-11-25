@@ -13,7 +13,7 @@ from aiojellyfin import Artist, Connection
 from aiojellyfin import Track as JellyTrack
 from aiojellyfin.session import SessionConfiguration
 from mashumaro.codecs.json import JSONDecoder
-from music_assistant_models.enums import ContentType
+from music_assistant_models.enums import ContentType, ExternalID
 
 from music_assistant.providers.jellyfin.const import (
     ITEM_KEY_CONTAINER,
@@ -131,6 +131,45 @@ def test_parse_loudness(track: dict[str, Any], expected: tuple[float, float | No
 def test_parse_loudness_without_gain(track: dict[str, Any]) -> None:
     """Test no loudness is returned when Jellyfin has no track gain."""
     assert parse_loudness(cast("JellyTrack", track)) is None
+
+
+# made-up MusicBrainz ids for one track: its recording and its spot on a release
+RECORDING_ID = "3c5603f0-1f4b-4a6b-8c1d-9e2f3a4b5c6d"
+RELEASE_TRACK_ID = "0fefb355-6a7b-4c8d-9e0f-1a2b3c4d5e6f"
+
+
+@pytest.mark.parametrize(
+    ("provider_ids", "expected"),
+    [
+        (
+            {"MusicBrainzRecording": RECORDING_ID, "MusicBrainzTrack": RELEASE_TRACK_ID},
+            {
+                (ExternalID.MB_RECORDING, RECORDING_ID),
+                (ExternalID.MB_TRACK, RELEASE_TRACK_ID),
+            },
+        ),
+        ({"MusicBrainzRecording": RECORDING_ID}, {(ExternalID.MB_RECORDING, RECORDING_ID)}),
+        # without a recording id, MusicBrainzTrack still stands in for it
+        ({"MusicBrainzTrack": RELEASE_TRACK_ID}, {(ExternalID.MB_RECORDING, RELEASE_TRACK_ID)}),
+        ({"MusicBrainzRecording": "not-an-id"}, set()),
+        ({}, set()),
+    ],
+)
+async def test_parse_track_musicbrainz_ids(
+    connection: Connection,
+    provider_ids: dict[str, str],
+    expected: set[tuple[ExternalID, str]],
+) -> None:
+    """Test a track's recording id comes from MusicBrainzRecording, not MusicBrainzTrack."""
+    async with aiofiles.open(FIXTURES_DIR / "tracks/do_i_wanna_know.json", encoding="utf-8") as fp:
+        raw_data = ARTIST_DECODER.decode(await fp.read())
+    raw_data["ProviderIds"] = provider_ids
+    track = parse_track(_LOGGER, "xx-instance-id-xx", connection, raw_data)
+    assert {
+        (ext_type, value)
+        for ext_type, value in track.external_ids
+        if ext_type in (ExternalID.MB_RECORDING, ExternalID.MB_TRACK)
+    } == expected
 
 
 async def test_parse_track_does_not_leak_access_token(connection: Connection) -> None:
